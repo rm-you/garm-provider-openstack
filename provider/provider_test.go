@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cloudbase/garm-provider-common/params"
@@ -357,41 +358,42 @@ func TestDeleteInstance(t *testing.T) {
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
-	// Mock the response for server get by ID
+	var deleteRequested atomic.Bool
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "GET")
-		w.Header().Add("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
+		testhelper.TestMethod(t, r, http.MethodGet)
+		if deleteRequested.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		}`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"server":{"id":"d9072956-1560-487c-97f2-18bdf65ec749","name":"test-server","status":"ACTIVE","tags":["garm-controller-id=my-controller-id"]}}`)
 	})
 
-	// Mock the response for server deletion
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "POST")
-		w.Header().Add("Content-Type", "application/json")
+		testhelper.TestMethod(t, r, http.MethodPost)
+		deleteRequested.Store(true)
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
-		}
-		}`)
 	})
 
 	err := provider.DeleteInstance(ctx, "d9072956-1560-487c-97f2-18bdf65ec749")
+	assert.NoError(t, err)
+	assert.True(t, deleteRequested.Load())
+}
+
+func TestDeleteInstanceNotFound(t *testing.T) {
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
+
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, http.MethodGet)
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	provider := &openstackProvider{
+		cli: client.NewTestOpenStackClient(thclient.ServiceClient(fakeServer), "my-controller-id"),
+	}
+
+	err := provider.DeleteInstance(context.Background(), "d9072956-1560-487c-97f2-18bdf65ec749")
 	assert.NoError(t, err)
 }
 

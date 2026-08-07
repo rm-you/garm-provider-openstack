@@ -16,6 +16,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -621,38 +622,21 @@ func TestDeleteServer(t *testing.T) {
 	fakeServer := testhelper.SetupHTTP()
 	defer fakeServer.Teardown()
 
-	// Mock the response for server get by ID
+	var deleteRequested atomic.Bool
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "GET")
-		w.Header().Add("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
+		testhelper.TestMethod(t, r, http.MethodGet)
+		if deleteRequested.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		}`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"server":{"id":"d9072956-1560-487c-97f2-18bdf65ec749","name":"test-server","status":"ACTIVE","tags":["garm-controller-id=my-controller-id"]}}`)
 	})
 
-	// Mock the response for server deletion
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "POST")
-		w.Header().Add("Content-Type", "application/json")
+		testhelper.TestMethod(t, r, http.MethodPost)
+		deleteRequested.Store(true)
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
-		}
-		}`)
 	})
 
 	osClient := &OpenstackClient{
@@ -662,6 +646,74 @@ func TestDeleteServer(t *testing.T) {
 
 	err := osClient.DeleteServer(ctx, "d9072956-1560-487c-97f2-18bdf65ec749", true)
 	assert.NoError(t, err)
+	assert.True(t, deleteRequested.Load())
+}
+
+func TestDeleteServerNotFoundAfterReauthentication(t *testing.T) {
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
+
+	var deleteRequested atomic.Bool
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, http.MethodGet)
+		if !deleteRequested.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"server":{"id":"d9072956-1560-487c-97f2-18bdf65ec749","name":"test-server","status":"ACTIVE","tags":["garm-controller-id=my-controller-id"]}}`)
+			return
+		}
+		if r.Header.Get("X-Auth-Token") != "new-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, http.MethodPost)
+		deleteRequested.Store(true)
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	compute := client.ServiceClient(fakeServer)
+	compute.ProviderClient.UseTokenLock()
+	compute.ProviderClient.SetToken("old-token")
+	compute.ProviderClient.ReauthFunc = func(context.Context) error {
+		compute.ProviderClient.SetToken("new-token")
+		return nil
+	}
+	osClient := &OpenstackClient{compute: compute, controllerID: "my-controller-id"}
+
+	err := osClient.DeleteServer(context.Background(), "d9072956-1560-487c-97f2-18bdf65ec749", true)
+	assert.NoError(t, err)
+}
+
+func TestDeleteServerPreservesPollingDeadline(t *testing.T) {
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
+
+	var deleteRequested atomic.Bool
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+		if deleteRequested.Load() {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"server":{"id":"d9072956-1560-487c-97f2-18bdf65ec749","name":"test-server","status":"ACTIVE","tags":["garm-controller-id=my-controller-id"]}}`)
+	})
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
+		deleteRequested.Store(true)
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	osClient := &OpenstackClient{
+		compute:      client.ServiceClient(fakeServer),
+		controllerID: "my-controller-id",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := osClient.DeleteServer(ctx, "d9072956-1560-487c-97f2-18bdf65ec749", true)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), err)
 }
 
 func TestDeleteServerWithoutWaiting(t *testing.T) {
