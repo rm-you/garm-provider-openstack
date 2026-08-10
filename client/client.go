@@ -15,23 +15,25 @@
 package client
 
 import (
-	gErrors "errors"
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/availabilityzones"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/diskconfig"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/extendedstatus"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/startstop"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/networks"
-	"github.com/gophercloud/gophercloud/pagination"
-	"github.com/gophercloud/utils/openstack/clientconfig"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
+	"github.com/gophercloud/gophercloud/v2/pagination"
+	"github.com/gophercloud/utils/v2/openstack/clientconfig"
+	"github.com/gophercloud/utils/v2/openstack/keyringcache"
 
 	"github.com/cloudbase/garm-provider-openstack/config"
 )
@@ -41,7 +43,7 @@ const (
 	poolIDTagName       = "garm-pool-id"
 )
 
-func NewClient(cfg *config.Config, controllerID string) (*OpenstackClient, error) {
+func NewClient(ctx context.Context, cfg *config.Config, controllerID string) (*OpenstackClient, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config is nil")
 	}
@@ -53,24 +55,64 @@ func NewClient(cfg *config.Config, controllerID string) (*OpenstackClient, error
 		Cloud:    cfg.Cloud,
 		YAMLOpts: &cfg.Credentials,
 	}
-	compute, err := clientconfig.NewServiceClient("compute", &opts)
+	if cfg.EnableAuthTokenCache {
+		opts.TokenCache = keyringcache.New()
+		opts.TokenCacheNamespace = cfg.AuthTokenCacheNamespace
+	}
+
+	provider, err := clientconfig.AuthenticatedClient(ctx, &opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %w", err)
+	}
+	cloud, err := clientconfig.GetCloudFromYAML(&opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cloud configuration: %w", err)
+	}
+	region := os.Getenv("OS_REGION_NAME")
+	if cloud.RegionName != "" {
+		region = cloud.RegionName
+	}
+	endpointType := os.Getenv("OS_INTERFACE")
+	if cloud.EndpointType != "" {
+		endpointType = cloud.EndpointType
+	}
+	endpointOpts := gophercloud.EndpointOpts{
+		Region:       region,
+		Availability: clientconfig.GetEndpointType(endpointType),
+	}
+
+	compute, err := openstack.NewComputeV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get compute client: %w", err)
 	}
 	// Enables filter by tags, metadata property in VM list and boot from volume.
 	compute.Microversion = "2.67"
 
-	glance, err := clientconfig.NewServiceClient("image", &opts)
+	glance, err := openstack.NewImageV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get glance client: %w", err)
 	}
 
-	neutron, err := clientconfig.NewServiceClient("network", &opts)
+	neutron, err := openstack.NewNetworkV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get neutron client: %w", err)
 	}
 
-	cinder, err := clientconfig.NewServiceClient("volume", &opts)
+	volumeVersion := cloud.VolumeAPIVersion
+	if volumeVersion == "" {
+		volumeVersion = "3"
+	}
+	var cinder *gophercloud.ServiceClient
+	switch volumeVersion {
+	case "v1", "1":
+		cinder, err = openstack.NewBlockStorageV1(ctx, provider, endpointOpts)
+	case "v2", "2":
+		cinder, err = openstack.NewBlockStorageV2(ctx, provider, endpointOpts)
+	case "v3", "3":
+		cinder, err = openstack.NewBlockStorageV3(ctx, provider, endpointOpts)
+	default:
+		return nil, fmt.Errorf("invalid volume API version %q", volumeVersion)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cinder client: %w", err)
 	}
@@ -85,9 +127,6 @@ func NewClient(cfg *config.Config, controllerID string) (*OpenstackClient, error
 
 type ServerWithExt struct {
 	servers.Server
-	availabilityzones.ServerAvailabilityZoneExt
-	extendedstatus.ServerExtendedStatusExt
-	diskconfig.ServerDiskConfigExt
 }
 
 type OpenstackClient struct {
@@ -100,54 +139,64 @@ type OpenstackClient struct {
 }
 
 // CreateServerFromImage creates a new server from an image.
-func (o *OpenstackClient) CreateServerFromImage(createOpts servers.CreateOpts) (srv ServerWithExt, err error) {
+func (o *OpenstackClient) CreateServerFromImage(ctx context.Context, createOpts servers.CreateOpts) (srv ServerWithExt, err error) {
 	defer func() {
 		if err != nil {
+			nameOrID := createOpts.Name
 			if srv.ID != "" {
-				_ = o.DeleteServer(srv.ID, true)
-			} else {
-				_ = o.DeleteServer(createOpts.Name, true)
+				nameOrID = srv.ID
+			}
+			if cleanupErr := o.cleanupServer(ctx, nameOrID); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to clean up server: %w", cleanupErr))
 			}
 		}
 	}()
 
-	if err = servers.Create(o.compute, createOpts).ExtractInto(&srv); err != nil {
+	if err = servers.Create(ctx, o.compute, createOpts, nil).ExtractInto(&srv); err != nil {
 		return srv, fmt.Errorf("failed to create server: %w", err)
 	}
 
-	if err := o.waitForStatus(srv.ID, "ACTIVE", 120); err != nil {
-		return srv, fmt.Errorf("server did not reach ACTIVE state after 120 seconds: %w", err)
+	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 600); err != nil {
+		return srv, fmt.Errorf("server did not reach ACTIVE state after 600 seconds: %w", err)
 	}
 
-	return o.GetServer(srv.ID)
+	return o.GetServer(ctx, srv.ID)
 }
 
 // CreateServerFromVolume creates a new server from a volume.
-func (o *OpenstackClient) CreateServerFromVolume(createOpts bootfromvolume.CreateOptsExt, name string) (srv ServerWithExt, err error) {
+func (o *OpenstackClient) CreateServerFromVolume(ctx context.Context, createOpts servers.CreateOpts, name string) (srv ServerWithExt, err error) {
 	defer func() {
 		if err != nil {
+			nameOrID := name
 			if srv.ID != "" {
-				_ = o.DeleteServer(srv.ID, true)
-			} else {
-				_ = o.DeleteServer(name, true)
+				nameOrID = srv.ID
+			}
+			if cleanupErr := o.cleanupServer(ctx, nameOrID); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to clean up server: %w", cleanupErr))
 			}
 		}
 	}()
 
-	if err = bootfromvolume.Create(o.compute, createOpts).ExtractInto(&srv); err != nil {
+	if err = servers.Create(ctx, o.compute, createOpts, nil).ExtractInto(&srv); err != nil {
 		return srv, fmt.Errorf("failed to create server: %w", err)
 	}
 
-	if err := o.waitForStatus(srv.ID, "ACTIVE", 120); err != nil {
-		return srv, fmt.Errorf("server did not reach ACTIVE state after 120 seconds: %w", err)
+	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 600); err != nil {
+		return srv, fmt.Errorf("server did not reach ACTIVE state after 600 seconds: %w", err)
 	}
 
-	return o.GetServer(srv.ID)
+	return o.GetServer(ctx, srv.ID)
 }
 
-// GetServer creates a new server.
-func (o *OpenstackClient) GetServer(nameOrId string) (ServerWithExt, error) {
-	results, err := o.ListServersWithNameOrID(nameOrId)
+func (o *OpenstackClient) cleanupServer(ctx context.Context, nameOrID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return o.DeleteServer(cleanupCtx, nameOrID, true)
+}
+
+// GetServer returns the server matching a name or ID.
+func (o *OpenstackClient) GetServer(ctx context.Context, nameOrId string) (ServerWithExt, error) {
+	results, err := o.ListServersWithNameOrID(ctx, nameOrId)
 	if err != nil {
 		return ServerWithExt{}, fmt.Errorf("failed to find server: %w", err)
 	}
@@ -163,12 +212,12 @@ func (o *OpenstackClient) GetServer(nameOrId string) (ServerWithExt, error) {
 	return results[0], nil
 }
 
-func (o *OpenstackClient) ListServersWithTags(tags []string) ([]ServerWithExt, error) {
+func (o *OpenstackClient) ListServersWithTags(ctx context.Context, tags []string) ([]ServerWithExt, error) {
 	var srvResults []ServerWithExt
 	opts := servers.ListOpts{
 		Tags: strings.Join(tags, ","),
 	}
-	pages, err := servers.List(o.compute, opts).AllPages()
+	pages, err := servers.List(o.compute, opts).AllPages(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list servers: %w", err)
 	}
@@ -184,10 +233,10 @@ func (o *OpenstackClient) ListServersWithTags(tags []string) ([]ServerWithExt, e
 // ListServersWithNameOrID will return an array of servers that match a name or ID. When passing
 // in an ID, there is no chance that this function will return an array larger than one element.
 // When passing in a name, the function may return an array larger than 1 element.
-func (o *OpenstackClient) ListServersWithNameOrID(nameOrId string) ([]ServerWithExt, error) {
+func (o *OpenstackClient) ListServersWithNameOrID(ctx context.Context, nameOrId string) ([]ServerWithExt, error) {
 	if isUUID(nameOrId) {
 		var srv ServerWithExt
-		if err := servers.Get(o.compute, nameOrId).ExtractInto(&srv); err != nil {
+		if err := servers.Get(ctx, o.compute, nameOrId).ExtractInto(&srv); err != nil {
 			return nil, fmt.Errorf("failed to get server: %w", err)
 		}
 		var controllerIDValue string
@@ -210,7 +259,7 @@ func (o *OpenstackClient) ListServersWithNameOrID(nameOrId string) ([]ServerWith
 		controllerIDTagName + "=" + o.controllerID,
 	}
 
-	srvResults, err := o.ListServersWithTags(tags)
+	srvResults, err := o.ListServersWithTags(ctx, tags)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find server by name: %w", err)
 	}
@@ -225,23 +274,26 @@ func (o *OpenstackClient) ListServersWithNameOrID(nameOrId string) ([]ServerWith
 	return results, nil
 }
 
-// ListServers creates a new server.
-func (o *OpenstackClient) ListServers(poolID string) ([]ServerWithExt, error) {
+// ListServers returns servers belonging to a pool.
+func (o *OpenstackClient) ListServers(ctx context.Context, poolID string) ([]ServerWithExt, error) {
 	tags := []string{
 		poolIDTagName + "=" + poolID,
 		controllerIDTagName + "=" + o.controllerID,
 	}
 
-	return o.ListServersWithTags(tags)
+	return o.ListServersWithTags(ctx, tags)
 }
 
-func (o *OpenstackClient) waitForStatus(id, status string, secs int) error {
-	return gophercloud.WaitFor(secs, func() (bool, error) {
-		result := servers.Get(o.compute, id)
+func (o *OpenstackClient) waitForStatus(ctx context.Context, id, status string, secs int) error {
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(secs)*time.Second)
+	defer cancel()
+
+	return gophercloud.WaitFor(waitCtx, func(ctx context.Context) (bool, error) {
+		result := servers.Get(ctx, o.compute, id)
 
 		current, err := result.Extract()
 		if err != nil {
-			if _, ok := err.(gophercloud.ErrDefault404); ok && status == "DELETED" {
+			if gophercloud.ResponseCodeIs(err, http.StatusNotFound) && status == "DELETED" {
 				return true, nil
 			}
 			return false, fmt.Errorf("could not find server %s: %w", id, err)
@@ -259,8 +311,8 @@ func (o *OpenstackClient) waitForStatus(id, status string, secs int) error {
 	})
 }
 
-func (o *OpenstackClient) deleteServerByID(id string, waitForDelete bool) error {
-	response := servers.ForceDelete(o.compute, id)
+func (o *OpenstackClient) deleteServerByID(ctx context.Context, id string, waitForDelete bool) error {
+	response := servers.ForceDelete(ctx, o.compute, id)
 	if response.StatusCode == 404 {
 		return nil
 	}
@@ -270,7 +322,7 @@ func (o *OpenstackClient) deleteServerByID(id string, waitForDelete bool) error 
 	}
 
 	if waitForDelete {
-		if err := o.waitForStatus(id, "DELETED", 120); err != nil {
+		if err := o.waitForStatus(ctx, id, "DELETED", 600); err != nil {
 			return fmt.Errorf("failed to delete server: %w", err)
 		}
 	}
@@ -281,19 +333,17 @@ func (o *OpenstackClient) deleteServerByID(id string, waitForDelete bool) error 
 // DeleteServer server deletes servers that match nameOrID.
 // Warning: If a name is passed in, all servers with the same name, that match the controller ID
 // set in the tags, will be deleted
-func (o *OpenstackClient) DeleteServer(nameOrID string, waitForDelete bool) error {
-	results, err := o.ListServersWithNameOrID(nameOrID)
+func (o *OpenstackClient) DeleteServer(ctx context.Context, nameOrID string, waitForDelete bool) error {
+	results, err := o.ListServersWithNameOrID(ctx, nameOrID)
 	if err != nil {
-		// errors returned by gophercloud are not errors.Is compatible.
-		if _, ok := gErrors.Unwrap(err).(gophercloud.ErrDefault404); ok {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
 			return nil
 		}
 		return fmt.Errorf("failed to find server: %w", err)
 	}
 	for _, srv := range results {
-		if err := o.deleteServerByID(srv.ID, true); err != nil {
-			// errors returned by gophercloud are not errors.Is compatible.
-			if _, ok := gErrors.Unwrap(err).(gophercloud.ErrDefault404); ok {
+		if err := o.deleteServerByID(ctx, srv.ID, waitForDelete); err != nil {
+			if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
 				continue
 			}
 			return fmt.Errorf("failed to delete server with ID %s: %w", srv.ID, err)
@@ -303,15 +353,15 @@ func (o *OpenstackClient) DeleteServer(nameOrID string, waitForDelete bool) erro
 }
 
 // GetFlavor resolves a flavor name or ID to a flavor.
-func (o *OpenstackClient) GetFlavor(nameOrId string) (*flavors.Flavor, error) {
+func (o *OpenstackClient) GetFlavor(ctx context.Context, nameOrId string) (*flavors.Flavor, error) {
 	var flavor *flavors.Flavor
 	var err error
-	flavor, err = flavors.Get(o.compute, nameOrId).Extract()
+	flavor, err = flavors.Get(ctx, o.compute, nameOrId).Extract()
 	if err == nil {
 		return flavor, nil
 	}
 
-	if err := flavors.ListDetail(o.compute, nil).EachPage(func(page pagination.Page) (bool, error) {
+	if err := flavors.ListDetail(o.compute, nil).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 		flavorResults, err := flavors.ExtractFlavors(page)
 		if err != nil {
 			return false, fmt.Errorf("failed to extract flavors: %w", err)
@@ -337,12 +387,12 @@ func (o *OpenstackClient) GetFlavor(nameOrId string) (*flavors.Flavor, error) {
 }
 
 // GetImage gets details of an image passed in by ID.
-func (o *OpenstackClient) GetImage(nameOrID, imageVisibility string) (*images.Image, error) {
+func (o *OpenstackClient) GetImage(ctx context.Context, nameOrID, imageVisibility string) (*images.Image, error) {
 	var result *images.Image
 	var err error
 
 	if isUUID(nameOrID) {
-		result, err = images.Get(o.image, nameOrID).Extract()
+		result, err = images.Get(ctx, o.image, nameOrID).Extract()
 		if err != nil {
 			return nil, fmt.Errorf("failed to find image: %w", err)
 		}
@@ -360,7 +410,7 @@ func (o *OpenstackClient) GetImage(nameOrID, imageVisibility string) (*images.Im
 		Status:     images.ImageStatusActive,
 	}
 	// perhaps it's a name. List all images and look for the image by name.
-	if err := images.List(o.image, opts).EachPage(func(page pagination.Page) (bool, error) {
+	if err := images.List(o.image, opts).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 		imgResults, err := images.ExtractImages(page)
 		if err != nil {
 			return false, err
@@ -385,19 +435,19 @@ func (o *OpenstackClient) GetImage(nameOrID, imageVisibility string) (*images.Im
 }
 
 // GetNetwork returns network details
-func (o *OpenstackClient) GetNetwork(nameOrID string) (*networks.Network, error) {
+func (o *OpenstackClient) GetNetwork(ctx context.Context, nameOrID string) (*networks.Network, error) {
 	var net *networks.Network
 	var err error
 
 	if isUUID(nameOrID) {
-		net, err = networks.Get(o.network, nameOrID).Extract()
+		net, err = networks.Get(ctx, o.network, nameOrID).Extract()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get network: %w", err)
 		}
 		return net, nil
 	}
 
-	if err := networks.List(o.network, nil).EachPage(func(page pagination.Page) (bool, error) {
+	if err := networks.List(o.network, nil).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 		netResults, err := networks.ExtractNetworks(page)
 		if err != nil {
 			return false, fmt.Errorf("failed to extract networks: %w", err)
@@ -422,8 +472,8 @@ func (o *OpenstackClient) GetNetwork(nameOrID string) (*networks.Network, error)
 	return net, nil
 }
 
-func (o *OpenstackClient) StopServer(nameOrID string) error {
-	srv, err := o.GetServer(nameOrID)
+func (o *OpenstackClient) StopServer(ctx context.Context, nameOrID string) error {
+	srv, err := o.GetServer(ctx, nameOrID)
 	if err != nil {
 		return fmt.Errorf("failed to get server: %w", err)
 	}
@@ -432,15 +482,15 @@ func (o *OpenstackClient) StopServer(nameOrID string) error {
 		return nil
 	}
 
-	if err := startstop.Stop(o.compute, srv.ID).ExtractErr(); err != nil {
+	if err := servers.Stop(ctx, o.compute, srv.ID).ExtractErr(); err != nil {
 		return fmt.Errorf("failed to stop server: %w", err)
 	}
 
 	return nil
 }
 
-func (o *OpenstackClient) StartServer(nameOrID string) error {
-	srv, err := o.GetServer(nameOrID)
+func (o *OpenstackClient) StartServer(ctx context.Context, nameOrID string) error {
+	srv, err := o.GetServer(ctx, nameOrID)
 	if err != nil {
 		return fmt.Errorf("failed to get server: %w", err)
 	}
@@ -449,7 +499,7 @@ func (o *OpenstackClient) StartServer(nameOrID string) error {
 		return nil
 	}
 
-	if err := startstop.Start(o.compute, srv.ID).ExtractErr(); err != nil {
+	if err := servers.Start(ctx, o.compute, srv.ID).ExtractErr(); err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
@@ -462,4 +512,66 @@ func isUUID(data string) bool {
 	}
 
 	return false
+}
+
+// CreateBootVolume creates and waits for a bootable Cinder volume.
+func (o *OpenstackClient) CreateBootVolume(ctx context.Context, name, imageID, volumeType, availabilityZone string, sizeGB int) (*volumes.Volume, error) {
+	createOpts := volumes.CreateOpts{
+		Name:             name,
+		Size:             sizeGB,
+		ImageID:          imageID,
+		VolumeType:       volumeType,
+		AvailabilityZone: availabilityZone,
+	}
+
+	vol, err := volumes.Create(ctx, o.volume, createOpts, nil).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create boot volume: %w", err)
+	}
+
+	if err := o.waitForVolumeStatus(ctx, vol.ID, "available", 300); err != nil {
+		waitErr := fmt.Errorf("boot volume did not become available after 300 seconds: %w", err)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if cleanupErr := o.DeleteVolume(cleanupCtx, vol.ID); cleanupErr != nil {
+			return nil, errors.Join(waitErr, fmt.Errorf("failed to clean up boot volume: %w", cleanupErr))
+		}
+		return nil, waitErr
+	}
+
+	return vol, nil
+}
+
+// DeleteVolume deletes a Cinder volume by ID.
+func (o *OpenstackClient) DeleteVolume(ctx context.Context, volumeID string) error {
+	err := volumes.Delete(ctx, o.volume, volumeID, nil).ExtractErr()
+	if err != nil {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete volume %s: %w", volumeID, err)
+	}
+	return nil
+}
+
+func (o *OpenstackClient) waitForVolumeStatus(ctx context.Context, id, status string, secs int) error {
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(secs)*time.Second)
+	defer cancel()
+
+	return gophercloud.WaitFor(waitCtx, func(ctx context.Context) (bool, error) {
+		vol, err := volumes.Get(ctx, o.volume, id).Extract()
+		if err != nil {
+			return false, fmt.Errorf("could not find volume %s: %w", id, err)
+		}
+
+		if vol.Status == status {
+			return true, nil
+		}
+
+		if vol.Status == "error" {
+			return false, fmt.Errorf("volume %s entered error state", id)
+		}
+
+		return false, nil
+	})
 }

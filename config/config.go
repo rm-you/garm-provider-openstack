@@ -19,7 +19,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
-	"github.com/gophercloud/utils/openstack/clientconfig"
+	"github.com/gophercloud/utils/v2/openstack/clientconfig"
 	"gopkg.in/yaml.v2"
 )
 
@@ -112,6 +112,18 @@ type Config struct {
 	//
 	// This value can be overwritten using extra_specs.
 	EnableBootDebug bool `toml:"enable_boot_debug"`
+
+	// AvailabilityZone is the availability zone in which to create servers. If empty,
+	// the server is created in the default availability zone configured in the cloud.
+	//
+	// This value can be overwritten using extra_specs.
+	AvailabilityZone string `toml:"availability_zone"`
+
+	// EnableAuthTokenCache stores OIDC and WebSSO tokens in the system keyring.
+	EnableAuthTokenCache bool `toml:"enable_auth_token_cache"`
+
+	// AuthTokenCacheNamespace identifies the WebSSO profile. It defaults to Cloud.
+	AuthTokenCacheNamespace string `toml:"auth_token_cache_namespace"`
 }
 
 func (c *Config) Validate() error {

@@ -21,11 +21,10 @@ import (
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm-provider-common/util"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/networks"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/invopop/jsonschema"
 	"github.com/xeipuuv/gojsonschema"
 
@@ -55,6 +54,7 @@ type extraSpecs struct {
 	EnableBootDebug    *bool    `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable cloud-init debug mode. Adds 'set -x' into the cloud-init script."`
 	DisableUpdates     *bool    `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
 	ExtraPackages      []string `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
+	AvailabilityZone   string   `json:"availability_zone,omitempty" jsonschema:"description=The availability zone in which to create the server."`
 	// The Cloudconfig struct from common package
 	cloudconfig.CloudConfigSpec
 }
@@ -154,6 +154,7 @@ func NewMachineSpec(data params.BootstrapInstance, cfg *config.Config, controlle
 		BootFromVolume:     cfg.BootFromVolume,
 		BootDiskSize:       bootDiskSize,
 		UseConfigDrive:     cfg.UseConfigDrive,
+		AvailabilityZone:   cfg.AvailabilityZone,
 		Flavor:             data.Flavor,
 		Image:              data.Image,
 		Tools:              tools,
@@ -180,6 +181,7 @@ type machineSpec struct {
 	BootFromVolume     bool
 	BootDiskSize       int64
 	UseConfigDrive     bool
+	AvailabilityZone   string
 	Flavor             string
 	Image              string
 	DisableUpdates     bool
@@ -283,6 +285,10 @@ func (m *machineSpec) MergeExtraSpecs(spec extraSpecs) {
 	if config.IsValidVisibility(spec.ImageVisibility) {
 		m.ImageVisibility = spec.ImageVisibility
 	}
+
+	if spec.AvailabilityZone != "" {
+		m.AvailabilityZone = spec.AvailabilityZone
+	}
 }
 
 func (m *machineSpec) ComposeUserData() ([]byte, error) {
@@ -307,10 +313,11 @@ func (m *machineSpec) GetServerCreateOpts(flavor flavors.Flavor, net networks.Ne
 		return servers.CreateOpts{}, fmt.Errorf("failed to get user data: %w", err)
 	}
 	return servers.CreateOpts{
-		Name:           m.BootstrapParams.Name,
-		ImageRef:       img.ID,
-		FlavorRef:      flavor.ID,
-		SecurityGroups: m.SecurityGroups,
+		Name:             m.BootstrapParams.Name,
+		ImageRef:         img.ID,
+		FlavorRef:        flavor.ID,
+		SecurityGroups:   m.SecurityGroups,
+		AvailabilityZone: m.AvailabilityZone,
 		Networks: []servers.Network{
 			{
 				UUID: net.ID,
@@ -323,24 +330,17 @@ func (m *machineSpec) GetServerCreateOpts(flavor flavors.Flavor, net networks.Ne
 	}, nil
 }
 
-func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts) (bootfromvolume.CreateOptsExt, error) {
-	rootDisk := bootfromvolume.BlockDevice{
+func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts, volumeID string) servers.CreateOpts {
+	rootDisk := servers.BlockDevice{
 		DeleteOnTermination: true,
-		DestinationType:     bootfromvolume.DestinationVolume,
-		SourceType:          bootfromvolume.SourceImage,
-		UUID:                srvOpts.ImageRef,
-		VolumeSize:          int(m.BootDiskSize),
+		DestinationType:     servers.DestinationVolume,
+		SourceType:          servers.SourceVolume,
+		UUID:                volumeID,
+		BootIndex:           0,
 	}
-	if m.StorageBackend != "" {
-		rootDisk.VolumeType = m.StorageBackend
-	}
-	blockDevices := []bootfromvolume.BlockDevice{
-		rootDisk,
-	}
-	return bootfromvolume.CreateOptsExt{
-		CreateOptsBuilder: srvOpts,
-		BlockDevice:       blockDevices,
-	}, nil
+	srvOpts.BlockDevice = []servers.BlockDevice{rootDisk}
+	srvOpts.ImageRef = ""
+	return srvOpts
 }
 
 func Ptr[T any](v T) *T {

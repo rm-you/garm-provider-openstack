@@ -17,7 +17,7 @@
 
 package client
 
-import "github.com/gophercloud/gophercloud"
+import "github.com/gophercloud/gophercloud/v2"
 
 func NewTestOpenStackClient(mockClient *gophercloud.ServiceClient, controllerID string) *OpenstackClient {
 	return &OpenstackClient{
