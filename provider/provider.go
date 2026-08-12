@@ -47,13 +47,13 @@ var addrTypeMap = map[string]params.AddressType{
 	"floating": params.PublicAddress,
 }
 
-func NewOpenStackProvider(configPath, controllerID string) (execution.ExternalProvider, error) {
+func NewOpenStackProvider(ctx context.Context, configPath, controllerID string) (execution.ExternalProvider, error) {
 	conf, err := config.NewConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("error loading config: %w", err)
 	}
 
-	cli, err := client.NewClient(conf, controllerID)
+	cli, err := client.NewClient(ctx, conf, controllerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get client: %w", err)
 	}
@@ -131,17 +131,17 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to build machine spec: %w", err)
 	}
-	flavor, err := a.cli.GetFlavor(spec.Flavor)
+	flavor, err := a.cli.GetFlavor(ctx, spec.Flavor)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to resolve flavor %s: %w", bootstrapParams.Flavor, err)
 	}
 
-	net, err := a.cli.GetNetwork(spec.NetworkID)
+	net, err := a.cli.GetNetwork(ctx, spec.NetworkID)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to resolve network %s: %w", spec.NetworkID, err)
 	}
 
-	image, err := a.cli.GetImage(spec.Image, spec.ImageVisibility)
+	image, err := a.cli.GetImage(ctx, spec.Image, spec.ImageVisibility)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to resolve image info: %w", err)
 	}
@@ -169,7 +169,7 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 
 	var srv client.ServerWithExt
 	if !spec.BootFromVolume {
-		srv, err = a.cli.CreateServerFromImage(srvCreateOpts)
+		srv, err = a.cli.CreateServerFromImage(ctx, srvCreateOpts)
 		if err != nil {
 			return params.ProviderInstance{}, fmt.Errorf("failed to create server: %w", err)
 		}
@@ -178,7 +178,7 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 		if err != nil {
 			return params.ProviderInstance{}, fmt.Errorf("failed to get boot from volume create options: %w", err)
 		}
-		srv, err = a.cli.CreateServerFromVolume(createOption, spec.BootstrapParams.Name)
+		srv, err = a.cli.CreateServerFromVolume(ctx, createOption, spec.BootstrapParams.Name)
 		if err != nil {
 			return params.ProviderInstance{}, fmt.Errorf("failed to create server: %w", err)
 		}
@@ -188,7 +188,7 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 
 // Delete instance will delete the instance in a provider.
 func (a *openstackProvider) DeleteInstance(ctx context.Context, instance string) error {
-	if err := a.cli.DeleteServer(instance, true); err != nil {
+	if err := a.cli.DeleteServer(ctx, instance, true); err != nil {
 		return fmt.Errorf("failed to delete server: %w", err)
 	}
 	return nil
@@ -196,7 +196,7 @@ func (a *openstackProvider) DeleteInstance(ctx context.Context, instance string)
 
 // GetInstance will return details about one instance.
 func (a *openstackProvider) GetInstance(ctx context.Context, instance string) (params.ProviderInstance, error) {
-	srv, err := a.cli.GetServer(instance)
+	srv, err := a.cli.GetServer(ctx, instance)
 	if err != nil {
 		return params.ProviderInstance{}, fmt.Errorf("failed to get server: %w", err)
 	}
@@ -205,7 +205,7 @@ func (a *openstackProvider) GetInstance(ctx context.Context, instance string) (p
 
 // ListInstances will list all instances for a provider.
 func (a *openstackProvider) ListInstances(ctx context.Context, poolID string) ([]params.ProviderInstance, error) {
-	servers, err := a.cli.ListServers(poolID)
+	servers, err := a.cli.ListServers(ctx, poolID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list servers: %w", err)
 	}
@@ -224,7 +224,7 @@ func (a *openstackProvider) RemoveAllInstances(ctx context.Context) error {
 
 // Stop shuts down the instance.
 func (a *openstackProvider) Stop(ctx context.Context, instance string, force bool) error {
-	if err := a.cli.StopServer(instance); err != nil {
+	if err := a.cli.StopServer(ctx, instance); err != nil {
 		return fmt.Errorf("failed to stop server: %w", err)
 	}
 	return nil
@@ -232,7 +232,7 @@ func (a *openstackProvider) Stop(ctx context.Context, instance string, force boo
 
 // Start boots up an instance.
 func (a *openstackProvider) Start(ctx context.Context, instance string) error {
-	if err := a.cli.StartServer(instance); err != nil {
+	if err := a.cli.StartServer(ctx, instance); err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 	return nil

@@ -22,9 +22,9 @@ import (
 	"testing"
 
 	"github.com/cloudbase/garm-provider-common/params"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/testhelper"
-	thclient "github.com/gophercloud/gophercloud/testhelper/client"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/testhelper"
+	thclient "github.com/gophercloud/gophercloud/v2/testhelper/client"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/cloudbase/garm-provider-openstack/client"
@@ -75,8 +75,8 @@ func TestOpenstackServerToInstance(t *testing.T) {
 
 func TestCreateInstance(t *testing.T) {
 	ctx := context.Background()
-	testhelper.SetupHTTP()
-	defer testhelper.TeardownHTTP()
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
 	provider := &openstackProvider{
 		cfg: &config.Config{
 			Cloud: "mycloud",
@@ -92,7 +92,7 @@ func TestCreateInstance(t *testing.T) {
 		cli:          &client.OpenstackClient{},
 		controllerID: "my-controller-id",
 	}
-	serviceClient := thclient.ServiceClient()
+	serviceClient := thclient.ServiceClient(fakeServer)
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 	data := params.BootstrapInstance{
@@ -130,7 +130,7 @@ func TestCreateInstance(t *testing.T) {
 	}
 
 	// Mock the response for flavor get by ID
-	testhelper.Mux.HandleFunc("/flavors/detail", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/flavors/detail", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -149,7 +149,7 @@ func TestCreateInstance(t *testing.T) {
 	})
 
 	// Mock the response for network get by ID
-	testhelper.Mux.HandleFunc("/networks/542b68dd-4b3d-459d-8531-34d5e779d4d6", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/networks/542b68dd-4b3d-459d-8531-34d5e779d4d6", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -163,7 +163,7 @@ func TestCreateInstance(t *testing.T) {
 	})
 
 	// Mock the response for image get by ID
-	testhelper.Mux.HandleFunc("/images", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/images", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -182,7 +182,7 @@ func TestCreateInstance(t *testing.T) {
 	})
 
 	// Mock the response for server create
-	testhelper.Mux.HandleFunc("/servers", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "POST")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -213,7 +213,7 @@ func TestCreateInstance(t *testing.T) {
 	})
 
 	// Mock the response for server get by ID
-	testhelper.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -266,8 +266,8 @@ func TestCreateInstance(t *testing.T) {
 
 func TestDeleteInstance(t *testing.T) {
 	ctx := context.Background()
-	testhelper.SetupHTTP()
-	defer testhelper.TeardownHTTP()
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
 	provider := &openstackProvider{
 		cfg: &config.Config{
 			Cloud: "mycloud",
@@ -282,12 +282,12 @@ func TestDeleteInstance(t *testing.T) {
 		},
 		controllerID: "my-controller-id",
 	}
-	serviceClient := thclient.ServiceClient()
+	serviceClient := thclient.ServiceClient(fakeServer)
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
 	// Mock the response for server get by ID
-	testhelper.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -304,7 +304,7 @@ func TestDeleteInstance(t *testing.T) {
 	})
 
 	// Mock the response for server deletion
-	testhelper.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "POST")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -326,8 +326,8 @@ func TestDeleteInstance(t *testing.T) {
 
 func TestGetInstance(t *testing.T) {
 	ctx := context.Background()
-	testhelper.SetupHTTP()
-	defer testhelper.TeardownHTTP()
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
 	provider := &openstackProvider{
 		cfg: &config.Config{
 			Cloud: "mycloud",
@@ -342,12 +342,12 @@ func TestGetInstance(t *testing.T) {
 		},
 		controllerID: "my-controller-id",
 	}
-	serviceClient := thclient.ServiceClient()
+	serviceClient := thclient.ServiceClient(fakeServer)
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
 	// Mock the response for server get by ID
-	testhelper.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -400,8 +400,8 @@ func TestGetInstance(t *testing.T) {
 
 func TestListInstances(t *testing.T) {
 	ctx := context.Background()
-	testhelper.SetupHTTP()
-	defer testhelper.TeardownHTTP()
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
 	provider := &openstackProvider{
 		cfg: &config.Config{
 			Cloud: "mycloud",
@@ -416,12 +416,12 @@ func TestListInstances(t *testing.T) {
 		},
 		controllerID: "my-controller-id",
 	}
-	serviceClient := thclient.ServiceClient()
+	serviceClient := thclient.ServiceClient(fakeServer)
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
 	// Mock the response for server list
-	testhelper.Mux.HandleFunc("/servers/detail", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/detail", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -478,8 +478,8 @@ func TestListInstances(t *testing.T) {
 
 func TestStart(t *testing.T) {
 	ctx := context.Background()
-	testhelper.SetupHTTP()
-	defer testhelper.TeardownHTTP()
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
 	provider := &openstackProvider{
 		cfg: &config.Config{
 			Cloud: "mycloud",
@@ -494,12 +494,12 @@ func TestStart(t *testing.T) {
 		},
 		controllerID: "my-controller-id",
 	}
-	serviceClient := thclient.ServiceClient()
+	serviceClient := thclient.ServiceClient(fakeServer)
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
 	// Mock the response for server list
-	testhelper.Mux.HandleFunc("/servers/detail", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/detail", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "GET")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -532,7 +532,7 @@ func TestStart(t *testing.T) {
 	})
 
 	// Mock the response for server stop
-	testhelper.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "POST")
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)

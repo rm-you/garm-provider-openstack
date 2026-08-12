@@ -19,7 +19,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
-	"github.com/gophercloud/utils/openstack/clientconfig"
+	"github.com/gophercloud/utils/v2/openstack/clientconfig"
 	"gopkg.in/yaml.v2"
 )
 
