@@ -43,7 +43,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	prov, err := provider.NewOpenStackProvider(executionEnv.ProviderConfigFile, executionEnv.ControllerID)
+	prov, err := provider.NewOpenStackProvider(ctx, executionEnv.ProviderConfigFile, executionEnv.ControllerID)
 	if err != nil {
 		//nolint:gocritic
 		log.Fatal(err)

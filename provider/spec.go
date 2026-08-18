@@ -21,11 +21,10 @@ import (
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm-provider-common/util"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
-	"github.com/gophercloud/gophercloud/openstack/networking/v2/networks"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/invopop/jsonschema"
 	"github.com/xeipuuv/gojsonschema"
 
@@ -323,24 +322,19 @@ func (m *machineSpec) GetServerCreateOpts(flavor flavors.Flavor, net networks.Ne
 	}, nil
 }
 
-func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts) (bootfromvolume.CreateOptsExt, error) {
-	rootDisk := bootfromvolume.BlockDevice{
+func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts) (servers.CreateOpts, error) {
+	rootDisk := servers.BlockDevice{
 		DeleteOnTermination: true,
-		DestinationType:     bootfromvolume.DestinationVolume,
-		SourceType:          bootfromvolume.SourceImage,
+		DestinationType:     servers.DestinationVolume,
+		SourceType:          servers.SourceImage,
 		UUID:                srvOpts.ImageRef,
 		VolumeSize:          int(m.BootDiskSize),
 	}
 	if m.StorageBackend != "" {
 		rootDisk.VolumeType = m.StorageBackend
 	}
-	blockDevices := []bootfromvolume.BlockDevice{
-		rootDisk,
-	}
-	return bootfromvolume.CreateOptsExt{
-		CreateOptsBuilder: srvOpts,
-		BlockDevice:       blockDevices,
-	}, nil
+	srvOpts.BlockDevice = []servers.BlockDevice{rootDisk}
+	return srvOpts, nil
 }
 
 func Ptr[T any](v T) *T {

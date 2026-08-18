@@ -20,6 +20,7 @@ import (
 
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	"github.com/cloudbase/garm-provider-common/params"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/cloudbase/garm-provider-openstack/config"
@@ -554,6 +555,32 @@ func TestNewMachineSpec(t *testing.T) {
 	spec, err := NewMachineSpec(data, config, "controllerID")
 	assert.NoError(t, err)
 	assert.Equal(t, expectedOutput, spec)
+}
+
+func TestGetBootFromVolumeOpts(t *testing.T) {
+	srvOpts := servers.CreateOpts{
+		Name:      "runner",
+		ImageRef:  "image-id",
+		FlavorRef: "flavor-id",
+	}
+	spec := &machineSpec{
+		BootDiskSize:   100,
+		StorageBackend: "fast",
+	}
+
+	got, err := spec.GetBootFromVolumeOpts(srvOpts)
+	assert.NoError(t, err)
+	assert.Equal(t, srvOpts.Name, got.Name)
+	assert.Equal(t, srvOpts.ImageRef, got.ImageRef)
+	assert.Equal(t, srvOpts.FlavorRef, got.FlavorRef)
+	if assert.Len(t, got.BlockDevice, 1) {
+		assert.Equal(t, servers.SourceImage, got.BlockDevice[0].SourceType)
+		assert.Equal(t, servers.DestinationVolume, got.BlockDevice[0].DestinationType)
+		assert.Equal(t, "image-id", got.BlockDevice[0].UUID)
+		assert.Equal(t, 100, got.BlockDevice[0].VolumeSize)
+		assert.Equal(t, "fast", got.BlockDevice[0].VolumeType)
+		assert.True(t, got.BlockDevice[0].DeleteOnTermination)
+	}
 }
 
 func TestMachineSpecValidate(t *testing.T) {
