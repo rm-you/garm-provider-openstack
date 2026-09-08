@@ -11,7 +11,10 @@ import (
 	tokens2 "github.com/gophercloud/gophercloud/v2/openstack/identity/v2/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/ec2tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oauth1"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oauth2mtls"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oidc"
 	tokens3 "github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/websso"
 	"github.com/gophercloud/gophercloud/v2/openstack/utils"
 )
 
@@ -36,7 +39,7 @@ const (
 //
 //	ao, err := openstack.AuthOptionsFromEnv()
 //	provider, err := openstack.NewClient(ao.IdentityEndpoint)
-//	client, err := openstack.NewIdentityV3(provider, gophercloud.EndpointOpts{})
+//	client, err := openstack.NewIdentityV3(ctx, provider, gophercloud.EndpointOpts{})
 func NewClient(endpoint string) (*gophercloud.ProviderClient, error) {
 	base, err := utils.BaseEndpoint(endpoint)
 	if err != nil {
@@ -69,7 +72,7 @@ func NewClient(endpoint string) (*gophercloud.ProviderClient, error) {
 //
 //	ao, err := openstack.AuthOptionsFromEnv()
 //	provider, err := openstack.AuthenticatedClient(ctx, ao)
-//	client, err := openstack.NewNetworkV2(provider, gophercloud.EndpointOpts{
+//	client, err := openstack.NewNetworkV2(ctx, provider, gophercloud.EndpointOpts{
 //		Region: os.Getenv("OS_REGION_NAME"),
 //	})
 func AuthenticatedClient(ctx context.Context, options gophercloud.AuthOptions) (*gophercloud.ProviderClient, error) {
@@ -121,7 +124,7 @@ type v2TokenNoReauth struct {
 func (v2TokenNoReauth) CanReauth() bool { return false }
 
 func v2auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint string, options tokens2.AuthOptionsBuilder, eo gophercloud.EndpointOpts) error {
-	v2Client, err := NewIdentityV2(client, eo)
+	v2Client, err := NewIdentityV2(ctx, client, eo)
 	if err != nil {
 		return err
 	}
@@ -162,8 +165,8 @@ func v2auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 			return nil
 		}
 	}
-	client.EndpointLocator = func(opts gophercloud.EndpointOpts) (string, error) {
-		return V2Endpoint(context.TODO(), client, catalog, opts)
+	client.EndpointLocator = func(ctx context.Context, opts gophercloud.EndpointOpts) (string, error) {
+		return V2Endpoint(ctx, client, catalog, opts)
 	}
 
 	return nil
@@ -176,7 +179,7 @@ func AuthenticateV3(ctx context.Context, client *gophercloud.ProviderClient, opt
 
 func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint string, opts tokens3.AuthOptionsBuilder, eo gophercloud.EndpointOpts) error {
 	// Override the generated service endpoint with the one returned by the version endpoint.
-	v3Client, err := NewIdentityV3(client, eo)
+	v3Client, err := NewIdentityV3(ctx, client, eo)
 	if err != nil {
 		return err
 	}
@@ -206,7 +209,7 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 		}
 
 		v3Client.SetToken(tokenID)
-		result := tokens3.Get(ctx, v3Client, tokenID)
+		result := tokens3.Get(ctx, v3Client, tokenID, nil)
 		if result.Err != nil {
 			return result.Err
 		}
@@ -222,11 +225,21 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 		}
 	} else {
 		var result tokens3.CreateResult
+		var authenticatedHeadersFunc func(string) map[string]string
 		switch opts.(type) {
 		case *ec2tokens.AuthOptions:
 			result = ec2tokens.Create(ctx, v3Client, opts)
 		case *oauth1.AuthOptions:
 			result = oauth1.Create(ctx, v3Client, opts)
+		case *websso.AuthOptions:
+			result = websso.Authenticate(ctx, v3Client, opts)
+		case *oidc.AuthOptions:
+			result = oidc.Create(ctx, v3Client, opts)
+		case *oauth2mtls.AuthOptions:
+			result = oauth2mtls.Create(ctx, v3Client, opts)
+			authenticatedHeadersFunc = func(token string) map[string]string {
+				return map[string]string{"Authorization": "Bearer " + token}
+			}
 		default:
 			result = tokens3.Create(ctx, v3Client, opts)
 		}
@@ -240,6 +253,8 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 		if err != nil {
 			return err
 		}
+
+		client.AuthenticatedHeadersFunc = authenticatedHeadersFunc
 	}
 
 	if opts.CanReauth() {
@@ -271,6 +286,18 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 			o := *ot
 			o.AllowReauth = false
 			tao = &o
+		case *websso.AuthOptions:
+			o := *ot
+			o.AllowReauth = false
+			tao = &o
+		case *oidc.AuthOptions:
+			o := *ot
+			o.AllowReauth = false
+			tao = &o
+		case *oauth2mtls.AuthOptions:
+			o := *ot
+			o.AllowReauth = false
+			tao = &o
 		default:
 			tao = opts
 		}
@@ -283,8 +310,8 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 			return nil
 		}
 	}
-	client.EndpointLocator = func(opts gophercloud.EndpointOpts) (string, error) {
-		return V3Endpoint(context.TODO(), client, catalog, opts)
+	client.EndpointLocator = func(ctx context.Context, opts gophercloud.EndpointOpts) (string, error) {
+		return V3Endpoint(ctx, client, catalog, opts)
 	}
 
 	return nil
@@ -292,13 +319,13 @@ func v3auth(ctx context.Context, client *gophercloud.ProviderClient, endpoint st
 
 // NewIdentityV2 creates a ServiceClient that may be used to interact with the
 // v2 identity service.
-func NewIdentityV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+func NewIdentityV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
 	endpoint := client.IdentityBase + "v2.0/"
 	clientType := "identity"
 	var err error
 	if !reflect.DeepEqual(eo, gophercloud.EndpointOpts{}) {
 		eo.ApplyDefaults(clientType)
-		endpoint, err = client.EndpointLocator(eo)
+		endpoint, err = client.EndpointLocator(ctx, eo)
 		if err != nil {
 			return nil, err
 		}
@@ -313,13 +340,13 @@ func NewIdentityV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOp
 
 // NewIdentityV3 creates a ServiceClient that may be used to access the v3
 // identity service.
-func NewIdentityV3(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+func NewIdentityV3(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
 	endpoint := client.IdentityBase + "v3/"
 	clientType := "identity"
 	var err error
 	if !reflect.DeepEqual(eo, gophercloud.EndpointOpts{}) {
 		eo.ApplyDefaults(clientType)
-		endpoint, err = client.EndpointLocator(eo)
+		endpoint, err = client.EndpointLocator(ctx, eo)
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +373,7 @@ func NewIdentityV3(client *gophercloud.ProviderClient, eo gophercloud.EndpointOp
 }
 
 // TODO(stephenfin): Allow passing aliases to all New${SERVICE}V${VERSION} methods in v3
-func initClientOpts(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts, clientType string, version int) (*gophercloud.ServiceClient, error) {
+func initClientOpts(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts, clientType string, version int) (*gophercloud.ServiceClient, error) {
 	sc := new(gophercloud.ServiceClient)
 
 	eo.ApplyDefaults(clientType)
@@ -355,7 +382,7 @@ func initClientOpts(client *gophercloud.ProviderClient, eo gophercloud.EndpointO
 	}
 	eo.Version = version
 
-	url, err := client.EndpointLocator(eo)
+	url, err := client.EndpointLocator(ctx, eo)
 	if err != nil {
 		return sc, err
 	}
@@ -368,143 +395,179 @@ func initClientOpts(client *gophercloud.ProviderClient, eo gophercloud.EndpointO
 
 // NewBareMetalV1 creates a ServiceClient that may be used with the v1
 // bare metal package.
-func NewBareMetalV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "baremetal", 1)
+func NewBareMetalV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "baremetal", 1)
+	if err != nil {
+		return sc, err
+	}
 	if !strings.HasSuffix(strings.TrimSuffix(sc.Endpoint, "/"), "v1") {
 		sc.ResourceBase = sc.Endpoint + "v1/"
 	}
-	return sc, err
+	return sc, nil
 }
 
 // NewBareMetalIntrospectionV1 creates a ServiceClient that may be used with the v1
 // bare metal introspection package.
-func NewBareMetalIntrospectionV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "baremetal-introspection", 1)
+func NewBareMetalIntrospectionV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "baremetal-introspection", 1)
 }
 
 // NewObjectStorageV1 creates a ServiceClient that may be used with the v1
 // object storage package.
-func NewObjectStorageV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "object-store", 1)
+func NewObjectStorageV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "object-store", 1)
 }
 
 // NewComputeV2 creates a ServiceClient that may be used with the v2 compute
 // package.
-func NewComputeV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "compute", 2)
+func NewComputeV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "compute", 2)
 }
 
 // NewNetworkV2 creates a ServiceClient that may be used with the v2 network
 // package.
-func NewNetworkV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "network", 2)
+func NewNetworkV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "network", 2)
+	if err != nil {
+		return sc, err
+	}
 	sc.ResourceBase = sc.Endpoint + "v2.0/"
-	return sc, err
+	return sc, nil
 }
 
 // TODO(stephenfin): Remove this in v3. We no longer support the V1 Block Storage service.
 // NewBlockStorageV1 creates a ServiceClient that may be used to access the v1
 // block storage service.
-func NewBlockStorageV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "volume", 1)
+func NewBlockStorageV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "volume", 1)
 }
 
 // NewBlockStorageV2 creates a ServiceClient that may be used to access the v2
 // block storage service.
-func NewBlockStorageV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "block-storage", 2)
+func NewBlockStorageV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "block-storage", 2)
 }
 
 // NewBlockStorageV3 creates a ServiceClient that may be used to access the v3 block storage service.
-func NewBlockStorageV3(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "block-storage", 3)
+func NewBlockStorageV3(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "block-storage", 3)
 }
 
 // NewSharedFileSystemV2 creates a ServiceClient that may be used to access the v2 shared file system service.
-func NewSharedFileSystemV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "shared-file-system", 2)
+func NewSharedFileSystemV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "shared-file-system", 2)
 }
 
 // NewOrchestrationV1 creates a ServiceClient that may be used to access the v1
 // orchestration service.
-func NewOrchestrationV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "orchestration", 1)
+func NewOrchestrationV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "orchestration", 1)
 }
 
 // NewDBV1 creates a ServiceClient that may be used to access the v1 DB service.
-func NewDBV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "database", 1)
+func NewDBV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "database", 1)
 }
 
 // NewDNSV2 creates a ServiceClient that may be used to access the v2 DNS
 // service.
-func NewDNSV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "dns", 2)
+func NewDNSV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "dns", 2)
+	if err != nil {
+		return sc, err
+	}
 	sc.ResourceBase = sc.Endpoint + "v2/"
-	return sc, err
+	return sc, nil
 }
 
 // NewImageV2 creates a ServiceClient that may be used to access the v2 image
 // service.
-func NewImageV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "image", 2)
+func NewImageV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "image", 2)
+	if err != nil {
+		return sc, err
+	}
 	sc.ResourceBase = sc.Endpoint + "v2/"
-	return sc, err
+	return sc, nil
 }
 
 // NewLoadBalancerV2 creates a ServiceClient that may be used to access the v2
 // load balancer service.
-func NewLoadBalancerV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "load-balancer", 2)
+func NewLoadBalancerV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "load-balancer", 2)
+	if err != nil {
+		return sc, err
+	}
 
 	// Fixes edge case having an OpenStack lb endpoint with trailing version number.
 	endpoint := strings.ReplaceAll(sc.Endpoint, "v2.0/", "")
 
 	sc.ResourceBase = endpoint + "v2.0/"
-	return sc, err
+	return sc, nil
 }
 
 // NewMetricV1 creates a ServiceClient that may be used with the v1 metric-storage
 // service (Aetos).
-func NewMetricV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "metric-storage", 1)
+func NewMetricV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "metric-storage", 1)
+	if err != nil {
+		return sc, err
+	}
 	sc.ResourceBase = sc.Endpoint + "api/v1/"
-	return sc, err
+	return sc, nil
 }
 
 // NewMessagingV2 creates a ServiceClient that may be used with the v2 messaging
 // service.
-func NewMessagingV2(client *gophercloud.ProviderClient, clientID string, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "message", 2)
+func NewMessagingV2(ctx context.Context, client *gophercloud.ProviderClient, clientID string, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "message", 2)
+	if err != nil {
+		return sc, err
+	}
 	sc.MoreHeaders = map[string]string{"Client-ID": clientID}
-	return sc, err
+	return sc, nil
 }
 
 // NewContainerV1 creates a ServiceClient that may be used with v1 container package
-func NewContainerV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "application-container", 1)
+func NewContainerV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "application-container", 1)
 }
 
 // NewKeyManagerV1 creates a ServiceClient that may be used with the v1 key
 // manager service.
-func NewKeyManagerV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	sc, err := initClientOpts(client, eo, "key-manager", 1)
+func NewKeyManagerV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "key-manager", 1)
+	if err != nil {
+		return sc, err
+	}
 	sc.ResourceBase = sc.Endpoint + "v1/"
-	return sc, err
+	return sc, nil
 }
 
 // NewContainerInfraV1 creates a ServiceClient that may be used with the v1 container infra management
 // package.
-func NewContainerInfraV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "container-infrastructure-management", 1)
+func NewContainerInfraV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "container-infrastructure-management", 1)
 }
 
 // NewWorkflowV2 creates a ServiceClient that may be used with the v2 workflow management package.
-func NewWorkflowV2(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "workflow", 2)
+func NewWorkflowV2(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "workflow", 2)
 }
 
 // NewPlacementV1 creates a ServiceClient that may be used with the placement package.
-func NewPlacementV1(client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
-	return initClientOpts(client, eo, "placement", 1)
+func NewPlacementV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	return initClientOpts(ctx, client, eo, "placement", 1)
+}
+
+// NewReservationV1 creates a ServiceClient that may be used with the reservation package.
+func NewReservationV1(ctx context.Context, client *gophercloud.ProviderClient, eo gophercloud.EndpointOpts) (*gophercloud.ServiceClient, error) {
+	sc, err := initClientOpts(ctx, client, eo, "reservation", 1)
+	if err != nil {
+		return sc, err
+	}
+	if !strings.HasSuffix(strings.TrimSuffix(sc.Endpoint, "/"), "v1") {
+		sc.ResourceBase = sc.Endpoint + "v1/"
+	}
+	return sc, nil
 }

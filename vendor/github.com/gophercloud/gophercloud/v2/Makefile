@@ -1,8 +1,8 @@
 undefine GOFLAGS
 
 GOLANGCI_LINT_VERSION?=v2.12.1
-GOTESTSUM_VERSION?=v1.13.0
-GO_TEST?=go run gotest.tools/gotestsum@$(GOTESTSUM_VERSION) --format testname --
+GO_TEST?=go tool gotestsum --format testname --
+GOTESTFLAGS?=
 TIMEOUT := "60m"
 
 ifeq ($(shell command -v podman 2> /dev/null),)
@@ -43,7 +43,7 @@ coverage:
 	$(GO_TEST) -shuffle on -covermode count -coverprofile cover.out -coverpkg=./... ./...
 .PHONY: coverage
 
-acceptance: acceptance-basic acceptance-baremetal acceptance-blockstorage acceptance-compute acceptance-container acceptance-containerinfra acceptance-db acceptance-dns acceptance-identity acceptance-image acceptance-keymanager acceptance-loadbalancer acceptance-messaging acceptance-metric acceptance-networking acceptance-objectstorage acceptance-orchestration acceptance-placement acceptance-sharedfilesystems acceptance-workflow
+acceptance: acceptance-basic acceptance-baremetal acceptance-blockstorage acceptance-compute acceptance-container acceptance-containerinfra acceptance-db acceptance-dns acceptance-identity acceptance-image acceptance-keymanager acceptance-loadbalancer acceptance-messaging acceptance-metric acceptance-networking acceptance-objectstorage acceptance-orchestration acceptance-placement acceptance-reservation acceptance-sharedfilesystems acceptance-workflow
 .PHONY: acceptance
 
 acceptance-basic:
@@ -71,7 +71,7 @@ acceptance-containerinfra:
 .PHONY: acceptance-containerinfra
 
 acceptance-db:
-	$(GO_TEST) -timeout $(TIMEOUT) -tags "fixtures acceptance" ./internal/acceptance/openstack/db/...
+	$(GO_TEST) -timeout $(TIMEOUT) $(GOTESTFLAGS) -tags "fixtures acceptance" ./internal/acceptance/openstack/db/...
 .PHONY: acceptance-db
 
 acceptance-dns:
@@ -122,8 +122,13 @@ acceptance-placement:
 	$(GO_TEST) -timeout $(TIMEOUT) -tags "fixtures acceptance" ./internal/acceptance/openstack/placement/...
 .PHONY: acceptance-placement
 
+acceptance-reservation:
+	$(GO_TEST) -timeout $(TIMEOUT) -tags "fixtures acceptance" ./internal/acceptance/openstack/reservation/...
+.PHONY: acceptance-reservation
+
 acceptance-sharedfilesystems:
 	$(GO_TEST) -timeout $(TIMEOUT) -tags "fixtures acceptance" ./internal/acceptance/openstack/sharedfilesystems/...
+	$(GO_TEST) -timeout $(TIMEOUT) -tags "fixtures acceptance shareattach" -run TestShareAttach ./internal/acceptance/openstack/compute/v2/
 .PHONY: acceptance-sharefilesystems
 
 acceptance-workflow:

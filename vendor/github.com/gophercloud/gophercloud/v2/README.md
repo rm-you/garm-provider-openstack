@@ -1,5 +1,5 @@
 # Gophercloud: an OpenStack SDK for Go
-[![Coverage Status](https://coveralls.io/repos/github/gophercloud/gophercloud/badge.svg?branch=master)](https://coveralls.io/github/gophercloud/gophercloud?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/gophercloud/gophercloud/badge.svg?branch=main)](https://coveralls.io/github/gophercloud/gophercloud?branch=main)
 
 Gophercloud is a Go SDK for OpenStack.
 
@@ -96,9 +96,9 @@ func main() {
 
 	// Use the ProviderClient and the endpoint options fetched from
 	// `clouds.yaml` to build a service client: a compute client in this
-	// case. Note that the contructor does not accept a `context.Context`:
-	// no further call to the OpenStack API is needed at this stage.
-	computeClient, err := openstack.NewComputeV2(providerClient, endpointOptions)
+	// case. Note that the contructor does accept a `context.Context`
+	// to resolve supported API microversions.
+	computeClient, err := openstack.NewComputeV2(ctx, providerClient, endpointOptions)
 	if err != nil {
 		panic(err)
 	}
@@ -135,7 +135,7 @@ func main() {
 		panic(err)
 	}
 
-	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{
+	computeClient, err := openstack.NewComputeV2(ctx, providerClient, gophercloud.EndpointOpts{
 		Region: os.Getenv("OS_REGION_NAME"),
 	})
 	if err != nil {
@@ -173,7 +173,7 @@ func main() {
 		panic(err)
 	}
 
-	computeClient, err := openstack.NewComputeV2(providerClient, gophercloud.EndpointOpts{
+	computeClient, err := openstack.NewComputeV2(ctx, providerClient, gophercloud.EndpointOpts{
 		Region: "RegionName",
 	})
 	if err != nil {

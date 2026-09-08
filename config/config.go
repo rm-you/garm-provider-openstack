@@ -19,7 +19,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
-	"github.com/gophercloud/utils/v2/openstack/clientconfig"
+	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 	"gopkg.in/yaml.v2"
 )
 
@@ -112,6 +112,12 @@ type Config struct {
 	//
 	// This value can be overwritten using extra_specs.
 	EnableBootDebug bool `toml:"enable_boot_debug"`
+
+	// EnableAuthTokenCache stores WebSSO tokens in the system keyring.
+	EnableAuthTokenCache bool `toml:"enable_auth_token_cache"`
+
+	// AuthTokenCacheNamespace identifies the WebSSO profile. It defaults to Cloud.
+	AuthTokenCacheNamespace string `toml:"auth_token_cache_namespace"`
 }
 
 func (c *Config) Validate() error {
@@ -187,7 +193,7 @@ func (c Credentials) Validate() error {
 	return nil
 }
 
-func readFile(filePath string) (map[string]clientconfig.Cloud, error) {
+func readFile(filePath string) (map[string]clouds.Cloud, error) {
 	if filePath == "" {
 		return nil, fmt.Errorf("missing clouds config")
 	}
@@ -199,12 +205,12 @@ func readFile(filePath string) (map[string]clientconfig.Cloud, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read clouds config: %w", err)
 	}
-	var clouds clientconfig.Clouds
-	err = yaml.Unmarshal(content, &clouds)
+	var config clouds.Clouds
+	err = yaml.Unmarshal(content, &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal yaml: %w", err)
 	}
-	return clouds.Clouds, nil
+	return config.Clouds, nil
 }
 
 func canAccess(filePath string) bool {
@@ -217,20 +223,20 @@ func canAccess(filePath string) bool {
 	return true
 }
 
-func (o *Credentials) LoadCloudsYAML() (map[string]clientconfig.Cloud, error) {
+func (o *Credentials) LoadCloudsYAML() (map[string]clouds.Cloud, error) {
 	return readFile(o.Clouds)
 }
 
-func (o *Credentials) LoadSecureCloudsYAML() (map[string]clientconfig.Cloud, error) {
+func (o *Credentials) LoadSecureCloudsYAML() (map[string]clouds.Cloud, error) {
 	if !canAccess(o.SecureClouds) {
-		return map[string]clientconfig.Cloud{}, nil
+		return map[string]clouds.Cloud{}, nil
 	}
 	return readFile(o.SecureClouds)
 }
 
-func (o *Credentials) LoadPublicCloudsYAML() (map[string]clientconfig.Cloud, error) {
+func (o *Credentials) LoadPublicCloudsYAML() (map[string]clouds.Cloud, error) {
 	if !canAccess(o.PublicClouds) {
-		return map[string]clientconfig.Cloud{}, nil
+		return map[string]clouds.Cloud{}, nil
 	}
 	return readFile(o.PublicClouds)
 }

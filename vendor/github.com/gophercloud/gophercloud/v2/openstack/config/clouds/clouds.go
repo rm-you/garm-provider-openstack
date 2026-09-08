@@ -1,0 +1,413 @@
+// package clouds provides a parser for OpenStack credentials stored in a clouds.yaml file.
+//
+// Example use:
+//
+//	ctx := context.Background()
+//	ao, eo, tlsConfig, err := clouds.Parse()
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	providerClient, err := config.NewProviderClient(ctx, ao, config.WithTLSConfig(tlsConfig))
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	networkClient, err := openstack.NewNetworkV2(ctx, providerClient, eo)
+//	if err != nil {
+//		panic(err)
+//	}
+package clouds
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path"
+	"reflect"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"go.yaml.in/yaml/v3"
+)
+
+// Parse fetches a clouds.yaml file from disk and returns the parsed
+// credentials.
+//
+// By default this function mimics the behaviour of python-openstackclient, which is:
+//
+//   - if the environment variable `OS_CLIENT_CONFIG_FILE` is set and points to a
+//     clouds.yaml, use that location as the only search location for `clouds.yaml` and `secure.yaml`;
+//   - otherwise, the search locations for `clouds.yaml` and `secure.yaml` are:
+//     1. the current working directory (on Linux: `./`)
+//     2. the directory `openstack` under the standard user config location for
+//     the operating system (on Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/openstack/`)
+//     3. on Linux, `/etc/openstack/`
+//
+// Once `clouds.yaml` is found in a search location, the same location is used to search for `secure.yaml`.
+//
+// Like in python-openstackclient, relative paths in the `clouds.yaml` section
+// `cacert` are interpreted as relative the the current directory, and not to
+// the `clouds.yaml` location.
+//
+// Search locations, as well as individual `clouds.yaml` properties, can be
+// overwritten with functional options.
+func Parse(opts ...ParseOption) (gophercloud.AuthOptions, gophercloud.EndpointOpts, *tls.Config, error) {
+	parsed, err := parseCloud(opts...)
+	if err != nil {
+		return gophercloud.AuthOptions{}, gophercloud.EndpointOpts{}, nil, err
+	}
+
+	// Build the scope with proper project domain separation
+	var scope *gophercloud.AuthScope
+	if trustID := parsed.cloud.AuthInfo.TrustID; trustID != "" {
+		scope = &gophercloud.AuthScope{
+			TrustID: trustID,
+		}
+	} else if systemScope := parsed.cloud.AuthInfo.SystemScope; systemScope != "" {
+		// System scoping for admin operations
+		if systemScope != "all" {
+			return gophercloud.AuthOptions{}, gophercloud.EndpointOpts{}, nil, fmt.Errorf("only system scope of all is supported")
+		}
+		scope = &gophercloud.AuthScope{
+			System: true,
+		}
+	} else if projectID := coalesce(parsed.options.projectID, parsed.cloud.AuthInfo.ProjectID); projectID != "" {
+		// Project scoping by ID
+		scope = &gophercloud.AuthScope{
+			ProjectID: projectID,
+		}
+	} else if projectName := coalesce(parsed.options.projectName, parsed.cloud.AuthInfo.ProjectName); projectName != "" {
+		// Project scoping by name requires project domain
+		scope = &gophercloud.AuthScope{
+			ProjectName: projectName,
+			// The follow UP PR will remove the fallback to
+			// DomainID and DomainName, and will require the user
+			// to specify the project domain explicitly.
+			DomainID:   coalesce(parsed.cloud.AuthInfo.ProjectDomainID, parsed.cloud.AuthInfo.DomainID),
+			DomainName: coalesce(parsed.cloud.AuthInfo.ProjectDomainName, parsed.cloud.AuthInfo.DomainName),
+		}
+	} else if domainID := coalesce(parsed.options.domainID, parsed.cloud.AuthInfo.DomainID); domainID != "" {
+		// Domain scoping by ID (when no project is specified)
+		scope = &gophercloud.AuthScope{
+			DomainID: domainID,
+		}
+	} else if domainName := coalesce(parsed.options.domainName, parsed.cloud.AuthInfo.DomainName); domainName != "" {
+		// Domain scoping by name (when no project is specified)
+		scope = &gophercloud.AuthScope{
+			DomainName: domainName,
+		}
+	}
+
+	return gophercloud.AuthOptions{
+			IdentityEndpoint:            coalesce(parsed.options.authURL, parsed.cloud.AuthInfo.AuthURL),
+			Username:                    coalesce(parsed.options.username, parsed.cloud.AuthInfo.Username),
+			UserID:                      coalesce(parsed.options.userID, parsed.cloud.AuthInfo.UserID),
+			Password:                    coalesce(parsed.options.password, parsed.cloud.AuthInfo.Password),
+			DomainID:                    coalesce(parsed.options.domainID, parsed.cloud.AuthInfo.UserDomainID, parsed.cloud.AuthInfo.DomainID),
+			DomainName:                  coalesce(parsed.options.domainName, parsed.cloud.AuthInfo.UserDomainName, parsed.cloud.AuthInfo.DomainName),
+			TenantID:                    coalesce(parsed.options.projectID, parsed.cloud.AuthInfo.ProjectID),
+			TenantName:                  coalesce(parsed.options.projectName, parsed.cloud.AuthInfo.ProjectName),
+			TokenID:                     coalesce(parsed.options.token, parsed.cloud.AuthInfo.Token),
+			Scope:                       coalesce(parsed.options.scope, scope),
+			ApplicationCredentialID:     coalesce(parsed.options.applicationCredentialID, parsed.cloud.AuthInfo.ApplicationCredentialID),
+			ApplicationCredentialName:   coalesce(parsed.options.applicationCredentialName, parsed.cloud.AuthInfo.ApplicationCredentialName),
+			ApplicationCredentialSecret: coalesce(parsed.options.applicationCredentialSecret, parsed.cloud.AuthInfo.ApplicationCredentialSecret),
+		},
+		parsed.endpointOpts,
+		parsed.tlsConfig,
+		nil
+}
+
+type parsedCloud struct {
+	cloud        Cloud
+	options      cloudOpts
+	endpointOpts gophercloud.EndpointOpts
+	tlsConfig    *tls.Config
+}
+
+func parseCloud(opts ...ParseOption) (*parsedCloud, error) {
+	options := cloudOpts{
+		cloudName:    os.Getenv("OS_CLOUD"),
+		region:       os.Getenv("OS_REGION_NAME"),
+		endpointType: os.Getenv("OS_INTERFACE"),
+		locations: func() []string {
+			if path := os.Getenv("OS_CLIENT_CONFIG_FILE"); path != "" {
+				return []string{path}
+			}
+			return nil
+		}(),
+	}
+
+	for _, apply := range opts {
+		apply(&options)
+	}
+
+	if options.cloudName == "" {
+		return nil, fmt.Errorf("the empty string \"\" is not a valid cloud name")
+	}
+
+	// Set the defaults and open the files for reading. This code only runs
+	// if no override has been set, because it is fallible.
+	if options.cloudsyamlReader == nil {
+		if len(options.locations) < 1 {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get the current working directory: %w", err)
+			}
+			userConfig, err := getUserConfig()
+			if err != nil {
+				return nil, err
+			}
+			options.locations = []string{path.Join(cwd, "clouds.yaml"), path.Join(userConfig, "openstack", "clouds.yaml"), path.Join("/etc", "openstack", "clouds.yaml")}
+		}
+
+		for _, cloudsPath := range options.locations {
+			f, err := os.Open(cloudsPath)
+			if err != nil {
+				continue
+			}
+			defer f.Close()
+			options.cloudsyamlReader = f
+
+			if options.secureyamlReader == nil {
+				securePath := path.Join(path.Dir(cloudsPath), "secure.yaml")
+				secureF, err := os.Open(securePath)
+				if err == nil {
+					defer secureF.Close()
+					options.secureyamlReader = secureF
+				}
+			}
+			break
+		}
+		if options.cloudsyamlReader == nil {
+			return nil, fmt.Errorf("clouds file not found. Search locations were: %v", options.locations)
+		}
+	}
+
+	// Parse the YAML payloads.
+	var clouds Clouds
+	if err := yaml.NewDecoder(options.cloudsyamlReader).Decode(&clouds); err != nil {
+		return nil, err
+	}
+
+	cloud, ok := clouds.Clouds[options.cloudName]
+	if !ok {
+		return nil, fmt.Errorf("cloud %q not found in clouds.yaml", options.cloudName)
+	}
+
+	if options.secureyamlReader != nil {
+		var secureClouds Clouds
+		if err := yaml.NewDecoder(options.secureyamlReader).Decode(&secureClouds); err != nil {
+			return nil, fmt.Errorf("failed to parse secure.yaml: %w", err)
+		}
+
+		if secureCloud, ok := secureClouds.Clouds[options.cloudName]; ok {
+			// If secureCloud has content and it differs from the cloud entry,
+			// merge the two together.
+			if !reflect.DeepEqual((gophercloud.AuthOptions{}), secureClouds) && !reflect.DeepEqual(clouds, secureClouds) {
+				var err error
+				cloud, err = mergeClouds(secureCloud, cloud)
+				if err != nil {
+					return nil, fmt.Errorf("unable to merge information from clouds.yaml and secure.yaml: %w", err)
+				}
+			}
+		}
+	}
+
+	cloud, err := mergeWithPublicClouds(cloud, &options)
+	if err != nil {
+		return nil, err
+	}
+	if cloud.AuthInfo == nil {
+		cloud.AuthInfo = new(AuthInfo)
+	}
+
+	tlsConfig, err := computeTLSConfig(cloud, options)
+	if err != nil {
+		return nil, fmt.Errorf("unable to compute TLS configuration: %w", err)
+	}
+
+	endpointType := coalesce(options.endpointType, cloud.EndpointType, cloud.Interface)
+
+	return &parsedCloud{
+		cloud:   cloud,
+		options: options,
+		endpointOpts: gophercloud.EndpointOpts{
+			Region:       coalesce(options.region, cloud.RegionName),
+			Availability: computeAvailability(endpointType),
+		},
+		tlsConfig: tlsConfig,
+	}, nil
+}
+
+func getUserConfig() (string, error) {
+	// Use XDG_CONFIG_HOME or fall back to ~/.config, matching the
+	// OpenStack convention for clouds.yaml location on all platforms.
+	userConfig := os.Getenv("XDG_CONFIG_HOME")
+	if userConfig != "" {
+		return userConfig, nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the user home directory: %w", err)
+	}
+	userConfig = path.Join(homeDir, ".config")
+	return userConfig, nil
+}
+
+func mergeWithPublicClouds(cloud Cloud, options *cloudOpts) (Cloud, error) {
+	var mergeWith string
+	if cloud.Profile != "" {
+		mergeWith = cloud.Profile
+	} else if cloud.Cloud != "" {
+		mergeWith = cloud.Cloud
+	} else {
+		return cloud, nil
+	}
+
+	// Code is executed only if cloud needs to be merged with a public
+	// profile, error are returned only loading clouds-public.yaml was
+	// needed
+	if options.cloudsPublicyamlReader == nil {
+		if len(options.publicLocations) < 1 {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return cloud, fmt.Errorf("failed to get the current directory: %w", err)
+			}
+			userConfig, err := getUserConfig()
+			if err != nil {
+				return cloud, err
+			}
+			options.publicLocations = []string{path.Join(cwd, "clouds-public.yaml"), path.Join(userConfig, "openstack", "clouds-public.yaml"), path.Join("/etc", "openstack", "clouds-public.yaml")}
+		}
+		for _, publicPath := range options.publicLocations {
+			f, err := os.Open(publicPath)
+			if err != nil {
+				continue
+			}
+			defer f.Close()
+			options.cloudsPublicyamlReader = f
+			break
+		}
+		if options.cloudsPublicyamlReader == nil {
+			return cloud, fmt.Errorf("clouds file not found. Search locations were: %v", options.publicLocations)
+		}
+	}
+
+	var publicClouds PublicClouds
+	if err := yaml.NewDecoder(options.cloudsPublicyamlReader).Decode(&publicClouds); err != nil {
+		return cloud, err
+	}
+
+	pCloud, ok := publicClouds.Clouds[mergeWith]
+	if !ok {
+		return cloud, nil
+	}
+
+	var err error
+	cloud, err = mergeClouds(cloud, pCloud)
+	if err != nil {
+		return cloud, fmt.Errorf("unable to merge information from clouds-public.yaml: %w", err)
+	}
+
+	return cloud, nil
+
+}
+
+// computeAvailability is a helper method to determine the endpoint type
+// requested by the user.
+func computeAvailability(endpointType string) gophercloud.Availability {
+	if endpointType == "internal" || endpointType == "internalURL" {
+		return gophercloud.AvailabilityInternal
+	}
+	if endpointType == "admin" || endpointType == "adminURL" {
+		return gophercloud.AvailabilityAdmin
+	}
+	return gophercloud.AvailabilityPublic
+}
+
+// coalesce returns the first argument that is not the zero value for its type,
+// or the zero value for its type.
+func coalesce[T comparable](items ...T) T {
+	var t T
+	for _, item := range items {
+		if item != t {
+			return item
+		}
+	}
+	return t
+}
+
+// mergeClouds merges two Clouds recursively (the AuthInfo also gets merged).
+// In case both Clouds define a value, the value in the 'override' cloud takes precedence
+func mergeClouds(override, cloud Cloud) (Cloud, error) {
+	overrideJson, err := json.Marshal(override)
+	if err != nil {
+		return Cloud{}, err
+	}
+	cloudJson, err := json.Marshal(cloud)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var overrideInterface any
+	err = json.Unmarshal(overrideJson, &overrideInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var cloudInterface any
+	err = json.Unmarshal(cloudJson, &cloudInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var mergedCloud Cloud
+	mergedInterface := mergeInterfaces(overrideInterface, cloudInterface)
+	mergedJson, err := json.Marshal(mergedInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	err = json.Unmarshal(mergedJson, &mergedCloud)
+	if err != nil {
+		return Cloud{}, err
+	}
+	return mergedCloud, nil
+}
+
+// merges two interfaces. In cases where a value is defined for both 'overridingInterface' and
+// 'inferiorInterface' the value in 'overridingInterface' will take precedence.
+func mergeInterfaces(overridingInterface, inferiorInterface any) any {
+	switch overriding := overridingInterface.(type) {
+	case map[string]any:
+		interfaceMap, ok := inferiorInterface.(map[string]any)
+		if !ok {
+			return overriding
+		}
+		for k, v := range interfaceMap {
+			if overridingValue, ok := overriding[k]; ok {
+				overriding[k] = mergeInterfaces(overridingValue, v)
+			} else {
+				overriding[k] = v
+			}
+		}
+	case []any:
+		list, ok := inferiorInterface.([]any)
+		if !ok {
+			return overriding
+		}
+
+		return append(overriding, list...)
+	case nil:
+		// mergeClouds(nil, map[string]interface{...}) -> map[string]interface{...}
+		v, ok := inferiorInterface.(map[string]any)
+		if ok {
+			return v
+		}
+	}
+	// We don't want to override with empty values
+	if reflect.DeepEqual(overridingInterface, nil) || reflect.DeepEqual(reflect.Zero(reflect.TypeOf(overridingInterface)).Interface(), overridingInterface) {
+		return inferiorInterface
+	} else {
+		return overridingInterface
+	}
+}
