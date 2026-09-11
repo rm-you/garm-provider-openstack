@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cloudbase/garm-provider-common/params"
@@ -120,6 +121,7 @@ func TestCreateInstance(t *testing.T) {
 			"storage_backend": "cinder_nvme",
 			"boot_from_volume": true,
 			"boot_disk_size": 150,
+			"availability_zone": "az1",
 			"use_config_drive": false,
 			"enable_boot_debug": false
 		}`),
@@ -181,9 +183,79 @@ func TestCreateInstance(t *testing.T) {
 		}`)
 	})
 
+	fakeServer.Mux.HandleFunc("/volumes", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, "POST")
+		var request struct {
+			Volume struct {
+				Name             string `json:"name"`
+				Size             int    `json:"size"`
+				ImageID          string `json:"imageRef"`
+				VolumeType       string `json:"volume_type"`
+				AvailabilityZone string `json:"availability_zone"`
+			} `json:"volume"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		assert.Equal(t, "test-instance-root", request.Volume.Name)
+		assert.Equal(t, 150, request.Volume.Size)
+		assert.Equal(t, "aee1d242-730f-431f-88c1-87630c0f07ba", request.Volume.ImageID)
+		assert.Equal(t, "cinder_nvme", request.Volume.VolumeType)
+		assert.Equal(t, "az1", request.Volume.AvailabilityZone)
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `
+		{
+		"volume": {
+			"id": "vol-uuid-1234-5678-abcd-ef0123456789",
+			"name": "test-instance-root",
+			"status": "available",
+			"size": 150,
+			"volume_type": "cinder_nvme",
+			"availability_zone": "az1"
+		}
+		}`)
+	})
+
+	fakeServer.Mux.HandleFunc("/volumes/vol-uuid-1234-5678-abcd-ef0123456789", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, "GET")
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `
+		{
+		"volume": {
+			"id": "vol-uuid-1234-5678-abcd-ef0123456789",
+			"name": "test-instance-root",
+			"status": "available",
+			"size": 150,
+			"volume_type": "cinder_nvme",
+			"availability_zone": "az1"
+		}
+		}`)
+	})
+
 	// Mock the response for server create
 	fakeServer.Mux.HandleFunc("/servers", func(w http.ResponseWriter, r *http.Request) {
 		testhelper.TestMethod(t, r, "POST")
+		var request struct {
+			Server struct {
+				ImageRef         string `json:"imageRef"`
+				AvailabilityZone string `json:"availability_zone"`
+				BlockDevice      []struct {
+					SourceType          string `json:"source_type"`
+					DestinationType     string `json:"destination_type"`
+					UUID                string `json:"uuid"`
+					DeleteOnTermination bool   `json:"delete_on_termination"`
+				} `json:"block_device_mapping_v2"`
+			} `json:"server"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		assert.Empty(t, request.Server.ImageRef)
+		assert.Equal(t, "az1", request.Server.AvailabilityZone)
+		if assert.Len(t, request.Server.BlockDevice, 1) {
+			assert.Equal(t, "volume", request.Server.BlockDevice[0].SourceType)
+			assert.Equal(t, "volume", request.Server.BlockDevice[0].DestinationType)
+			assert.Equal(t, "vol-uuid-1234-5678-abcd-ef0123456789", request.Server.BlockDevice[0].UUID)
+			assert.True(t, request.Server.BlockDevice[0].DeleteOnTermination)
+		}
 		w.Header().Add("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		fmt.Fprintf(w, `
@@ -286,41 +358,42 @@ func TestDeleteInstance(t *testing.T) {
 	mockCli := client.NewTestOpenStackClient(serviceClient, "my-controller-id")
 	provider.cli = mockCli
 
-	// Mock the response for server get by ID
+	var deleteRequested atomic.Bool
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "GET")
-		w.Header().Add("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
+		testhelper.TestMethod(t, r, http.MethodGet)
+		if deleteRequested.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		}`)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"server":{"id":"d9072956-1560-487c-97f2-18bdf65ec749","name":"test-server","status":"ACTIVE","tags":["garm-controller-id=my-controller-id"]}}`)
 	})
 
-	// Mock the response for server deletion
 	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749/action", func(w http.ResponseWriter, r *http.Request) {
-		testhelper.TestMethod(t, r, "POST")
-		w.Header().Add("Content-Type", "application/json")
+		testhelper.TestMethod(t, r, http.MethodPost)
+		deleteRequested.Store(true)
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `
-		{
-		"server": {
-			"id": "d9072956-1560-487c-97f2-18bdf65ec749",
-			"name": "test-server",
-			"status": "DELETED",
-			"tags": ["garm-controller-id=my-controller-id"],
-			"forceDelete": true
-		}
-		}`)
 	})
 
 	err := provider.DeleteInstance(ctx, "d9072956-1560-487c-97f2-18bdf65ec749")
+	assert.NoError(t, err)
+	assert.True(t, deleteRequested.Load())
+}
+
+func TestDeleteInstanceNotFound(t *testing.T) {
+	fakeServer := testhelper.SetupHTTP()
+	defer fakeServer.Teardown()
+
+	fakeServer.Mux.HandleFunc("/servers/d9072956-1560-487c-97f2-18bdf65ec749", func(w http.ResponseWriter, r *http.Request) {
+		testhelper.TestMethod(t, r, http.MethodGet)
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	provider := &openstackProvider{
+		cli: client.NewTestOpenStackClient(thclient.ServiceClient(fakeServer), "my-controller-id"),
+	}
+
+	err := provider.DeleteInstance(context.Background(), "d9072956-1560-487c-97f2-18bdf65ec749")
 	assert.NoError(t, err)
 }
 

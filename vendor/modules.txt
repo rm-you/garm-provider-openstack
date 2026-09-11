@@ -35,6 +35,7 @@ github.com/google/uuid
 ## explicit; go 1.25.0
 github.com/gophercloud/gophercloud/v2
 github.com/gophercloud/gophercloud/v2/openstack
+github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes
 github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors
 github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers
 github.com/gophercloud/gophercloud/v2/openstack/config

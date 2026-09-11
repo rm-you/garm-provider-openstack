@@ -96,6 +96,7 @@ func TestExtraSpecsFromBootstrapParams(t *testing.T) {
 					"storage_backend": "cinder_nvme",
 					"boot_from_volume": true,
 					"boot_disk_size": 150,
+					"availability_zone": "az2",
 					"use_config_drive": false,
 					"enable_boot_debug": true,
 					"disable_updates": true,
@@ -113,6 +114,7 @@ func TestExtraSpecsFromBootstrapParams(t *testing.T) {
 				StorageBackend:     "cinder_nvme",
 				BootFromVolume:     Ptr(true),
 				BootDiskSize:       Ptr(int64(150)),
+				AvailabilityZone:   "az2",
 				UseConfigDrive:     Ptr(false),
 				EnableBootDebug:    Ptr(true),
 				DisableUpdates:     Ptr(true),
@@ -208,6 +210,18 @@ func TestExtraSpecsFromBootstrapParams(t *testing.T) {
 			},
 			wantSpec: extraSpecs{
 				BootDiskSize: Ptr(int64(150)),
+			},
+			errString: "",
+		},
+		{
+			name: "specs just with availability zone",
+			input: params.BootstrapInstance{
+				ExtraSpecs: json.RawMessage(`{
+					"availability_zone": "az1"
+				}`),
+			},
+			wantSpec: extraSpecs{
+				AvailabilityZone: "az1",
 			},
 			errString: "",
 		},
@@ -402,6 +416,16 @@ func TestExtraSpecsFromBootstrapParams(t *testing.T) {
 			errString: "use_config_drive: Invalid type. Expected: boolean, given: string",
 		},
 		{
+			name: "invalid input for availability zone - wrong data type",
+			input: params.BootstrapInstance{
+				ExtraSpecs: json.RawMessage(`{
+					"availability_zone": 1
+				}`),
+			},
+			wantSpec:  extraSpecs{},
+			errString: "availability_zone: Invalid type. Expected: string, given: integer",
+		},
+		{
 			name: "invalid input for enable boot debug - wrong data type",
 			input: params.BootstrapInstance{
 				ExtraSpecs: json.RawMessage(`{
@@ -522,6 +546,7 @@ func TestNewMachineSpec(t *testing.T) {
 			"storage_backend": "cinder_nvme",
 			"boot_from_volume": true,
 			"boot_disk_size": 150,
+			"availability_zone": "az2",
 			"use_config_drive": false,
 			"enable_boot_debug": false
 		}`),
@@ -538,6 +563,7 @@ func TestNewMachineSpec(t *testing.T) {
 		NetworkID:          "542b68dd-4b3d-459d-8531-34d5e779d4d6",
 		BootFromVolume:     true,
 		BootDiskSize:       int64(150),
+		AvailabilityZone:   "az2",
 		UseConfigDrive:     false,
 		Flavor:             "m1.small",
 		Image:              "ubuntu-20.04",
@@ -559,26 +585,22 @@ func TestNewMachineSpec(t *testing.T) {
 
 func TestGetBootFromVolumeOpts(t *testing.T) {
 	srvOpts := servers.CreateOpts{
-		Name:      "runner",
-		ImageRef:  "image-id",
-		FlavorRef: "flavor-id",
-	}
-	spec := &machineSpec{
-		BootDiskSize:   100,
-		StorageBackend: "fast",
+		Name:             "runner",
+		ImageRef:         "image-id",
+		FlavorRef:        "flavor-id",
+		AvailabilityZone: "az1",
 	}
 
-	got, err := spec.GetBootFromVolumeOpts(srvOpts)
-	assert.NoError(t, err)
+	got := (&machineSpec{}).GetBootFromVolumeOpts(srvOpts, "volume-id")
+	assert.Empty(t, got.ImageRef)
 	assert.Equal(t, srvOpts.Name, got.Name)
-	assert.Equal(t, srvOpts.ImageRef, got.ImageRef)
 	assert.Equal(t, srvOpts.FlavorRef, got.FlavorRef)
+	assert.Equal(t, srvOpts.AvailabilityZone, got.AvailabilityZone)
 	if assert.Len(t, got.BlockDevice, 1) {
-		assert.Equal(t, servers.SourceImage, got.BlockDevice[0].SourceType)
+		assert.Equal(t, servers.SourceVolume, got.BlockDevice[0].SourceType)
 		assert.Equal(t, servers.DestinationVolume, got.BlockDevice[0].DestinationType)
-		assert.Equal(t, "image-id", got.BlockDevice[0].UUID)
-		assert.Equal(t, 100, got.BlockDevice[0].VolumeSize)
-		assert.Equal(t, "fast", got.BlockDevice[0].VolumeType)
+		assert.Equal(t, "volume-id", got.BlockDevice[0].UUID)
+		assert.Equal(t, 0, got.BlockDevice[0].BootIndex)
 		assert.True(t, got.BlockDevice[0].DeleteOnTermination)
 	}
 }
