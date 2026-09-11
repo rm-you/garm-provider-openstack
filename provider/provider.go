@@ -16,10 +16,13 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	execution "github.com/cloudbase/garm-provider-common/execution/v0.1.0"
 	"github.com/cloudbase/garm-provider-common/params"
+	"github.com/google/uuid"
 
 	"github.com/cloudbase/garm-provider-openstack/client"
 	"github.com/cloudbase/garm-provider-openstack/config"
@@ -30,8 +33,9 @@ var _ execution.ExternalProvider = &openstackProvider{}
 var Version = "v0.0.0-unknown"
 
 const (
-	controllerIDTagName = "garm-controller-id"
-	poolIDTagName       = "garm-pool-id"
+	controllerIDTagName  = "garm-controller-id"
+	poolIDTagName        = "garm-pool-id"
+	volumeCleanupTimeout = 5 * time.Minute
 )
 
 // GARM reserves pending states for its own lifecycle tracking.
@@ -176,13 +180,23 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 			return params.ProviderInstance{}, fmt.Errorf("failed to create server: %w", err)
 		}
 	} else {
-		createOption, err := spec.GetBootFromVolumeOpts(srvCreateOpts)
+		// Create the volume directly so Cinder receives its type and availability zone.
+		volName := fmt.Sprintf("%s-root", spec.BootstrapParams.Name)
+		vol, err := a.cli.CreateBootVolume(ctx, volName, image.ID, spec.StorageBackend, spec.AvailabilityZone, int(spec.BootDiskSize))
 		if err != nil {
-			return params.ProviderInstance{}, fmt.Errorf("failed to get boot from volume create options: %w", err)
+			return params.ProviderInstance{}, fmt.Errorf("failed to create boot volume: %w", err)
 		}
+
+		createOption := spec.GetBootFromVolumeOpts(srvCreateOpts, vol.ID)
 		srv, err = a.cli.CreateServerFromVolume(ctx, createOption, spec.BootstrapParams.Name)
 		if err != nil {
-			return params.ProviderInstance{}, fmt.Errorf("failed to create server: %w", err)
+			createErr := fmt.Errorf("failed to create server: %w", err)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), volumeCleanupTimeout)
+			defer cancel()
+			if cleanupErr := a.cli.CleanupVolume(cleanupCtx, vol.ID); cleanupErr != nil {
+				return params.ProviderInstance{}, errors.Join(createErr, fmt.Errorf("failed to clean up boot volume: %w", cleanupErr))
+			}
+			return params.ProviderInstance{}, createErr
 		}
 	}
 	return openstackServerToInstance(srv), nil
@@ -192,6 +206,10 @@ func (a *openstackProvider) CreateInstance(ctx context.Context, bootstrapParams 
 func (a *openstackProvider) DeleteInstance(ctx context.Context, instance string) error {
 	if err := a.cli.DeleteServer(ctx, instance, true); err != nil {
 		return fmt.Errorf("failed to delete server: %w", err)
+	}
+	// Failed creates have no Nova ID. GARM retries their deletion by name.
+	if uuid.Validate(instance) != nil {
+		return a.cli.CleanupBootVolumes(ctx, instance)
 	}
 	return nil
 }

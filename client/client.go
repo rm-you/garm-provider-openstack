@@ -16,6 +16,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
 	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	gophercloudconfig "github.com/gophercloud/gophercloud/v2/openstack/config"
@@ -38,8 +40,13 @@ import (
 )
 
 const (
-	controllerIDTagName = "garm-controller-id"
-	poolIDTagName       = "garm-pool-id"
+	controllerIDTagName    = "garm-controller-id"
+	poolIDTagName          = "garm-pool-id"
+	bootVolumeRequestIDKey = "garm-create-id"
+	volumeCreating         = "creating"
+
+	// Failed creates have a shorter detached cleanup budget than normal deletion.
+	serverCleanupTimeout = 5 * time.Minute
 )
 
 func NewClient(ctx context.Context, cfg *config.Config, controllerID string) (*OpenstackClient, error) {
@@ -141,10 +148,12 @@ type OpenstackClient struct {
 func (o *OpenstackClient) CreateServerFromImage(ctx context.Context, createOpts servers.CreateOpts) (srv ServerWithExt, err error) {
 	defer func() {
 		if err != nil {
+			nameOrID := createOpts.Name
 			if srv.ID != "" {
-				o.cleanupServer(ctx, srv.ID)
-			} else {
-				o.cleanupServer(ctx, createOpts.Name)
+				nameOrID = srv.ID
+			}
+			if cleanupErr := o.cleanupServer(ctx, nameOrID); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to clean up server: %w", cleanupErr))
 			}
 		}
 	}()
@@ -153,8 +162,8 @@ func (o *OpenstackClient) CreateServerFromImage(ctx context.Context, createOpts 
 		return srv, fmt.Errorf("failed to create server: %w", err)
 	}
 
-	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 120); err != nil {
-		return srv, fmt.Errorf("server did not reach ACTIVE state after 120 seconds: %w", err)
+	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 600); err != nil {
+		return srv, fmt.Errorf("server did not reach ACTIVE state after 600 seconds: %w", err)
 	}
 
 	return o.GetServer(ctx, srv.ID)
@@ -164,10 +173,12 @@ func (o *OpenstackClient) CreateServerFromImage(ctx context.Context, createOpts 
 func (o *OpenstackClient) CreateServerFromVolume(ctx context.Context, createOpts servers.CreateOpts, name string) (srv ServerWithExt, err error) {
 	defer func() {
 		if err != nil {
+			nameOrID := name
 			if srv.ID != "" {
-				o.cleanupServer(ctx, srv.ID)
-			} else {
-				o.cleanupServer(ctx, name)
+				nameOrID = srv.ID
+			}
+			if cleanupErr := o.cleanupServer(ctx, nameOrID); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to clean up server: %w", cleanupErr))
 			}
 		}
 	}()
@@ -176,20 +187,20 @@ func (o *OpenstackClient) CreateServerFromVolume(ctx context.Context, createOpts
 		return srv, fmt.Errorf("failed to create server: %w", err)
 	}
 
-	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 120); err != nil {
-		return srv, fmt.Errorf("server did not reach ACTIVE state after 120 seconds: %w", err)
+	if err := o.waitForStatus(ctx, srv.ID, "ACTIVE", 600); err != nil {
+		return srv, fmt.Errorf("server did not reach ACTIVE state after 600 seconds: %w", err)
 	}
 
 	return o.GetServer(ctx, srv.ID)
 }
 
-func (o *OpenstackClient) cleanupServer(ctx context.Context, id string) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 120*time.Second)
+func (o *OpenstackClient) cleanupServer(ctx context.Context, nameOrID string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serverCleanupTimeout)
 	defer cancel()
-	_ = o.DeleteServer(cleanupCtx, id, true)
+	return o.DeleteServer(cleanupCtx, nameOrID, true)
 }
 
-// GetServer creates a new server.
+// GetServer returns the server matching a name or ID.
 func (o *OpenstackClient) GetServer(ctx context.Context, nameOrId string) (ServerWithExt, error) {
 	results, err := o.ListServersWithNameOrID(ctx, nameOrId)
 	if err != nil {
@@ -269,7 +280,7 @@ func (o *OpenstackClient) ListServersWithNameOrID(ctx context.Context, nameOrId 
 	return results, nil
 }
 
-// ListServers creates a new server.
+// ListServers returns servers belonging to a pool.
 func (o *OpenstackClient) ListServers(ctx context.Context, poolID string) ([]ServerWithExt, error) {
 	tags := []string{
 		poolIDTagName + "=" + poolID,
@@ -298,7 +309,7 @@ func (o *OpenstackClient) waitForStatus(ctx context.Context, id, status string, 
 			return true, nil
 		}
 
-		if current.Status == "ERROR" {
+		if current.Status == "ERROR" && status != "DELETED" {
 			return false, fmt.Errorf("instance in ERROR state")
 		}
 
@@ -317,7 +328,7 @@ func (o *OpenstackClient) deleteServerByID(ctx context.Context, id string, waitF
 	}
 
 	if waitForDelete {
-		if err := o.waitForStatus(ctx, id, "DELETED", 120); err != nil {
+		if err := o.waitForStatus(ctx, id, "DELETED", 600); err != nil {
 			return fmt.Errorf("failed to delete server: %w", err)
 		}
 	}
@@ -337,7 +348,7 @@ func (o *OpenstackClient) DeleteServer(ctx context.Context, nameOrID string, wai
 		return fmt.Errorf("failed to find server: %w", err)
 	}
 	for _, srv := range results {
-		if err := o.deleteServerByID(ctx, srv.ID, true); err != nil {
+		if err := o.deleteServerByID(ctx, srv.ID, waitForDelete); err != nil {
 			if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
 				continue
 			}
@@ -507,4 +518,182 @@ func isUUID(data string) bool {
 	}
 
 	return false
+}
+
+// CreateBootVolume creates and waits for a bootable Cinder volume.
+func (o *OpenstackClient) CreateBootVolume(ctx context.Context, name, imageID, volumeType, availabilityZone string, sizeGB int) (*volumes.Volume, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	requestID := uuid.NewString()
+	createOpts := volumes.CreateOpts{
+		Name:             name,
+		Size:             sizeGB,
+		ImageID:          imageID,
+		VolumeType:       volumeType,
+		AvailabilityZone: availabilityZone,
+		Metadata: map[string]string{
+			controllerIDTagName:    o.controllerID,
+			bootVolumeRequestIDKey: requestID,
+		},
+	}
+
+	vol, err := volumes.Create(ctx, o.volume, createOpts, nil).Extract()
+	if err == nil && vol.ID == "" {
+		err = fmt.Errorf("volume create response has no ID")
+	}
+	if err != nil {
+		createErr := fmt.Errorf("failed to create boot volume: %w", err)
+		var responseErr gophercloud.ErrUnexpectedResponseCode
+		if errors.As(err, &responseErr) && responseErr.Actual >= 400 && responseErr.Actual < 500 && responseErr.Actual != http.StatusRequestTimeout {
+			return nil, createErr
+		}
+		// The API may have committed creation before the response was lost.
+		// Use the request ID, not just the name, to find this attempt's volumes.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serverCleanupTimeout)
+		defer cancel()
+		cleanupErr := waitFor(cleanupCtx, func(ctx context.Context) (bool, error) {
+			found, err := o.listBootVolumes(ctx, name, requestID)
+			if err != nil || len(found) == 0 {
+				return false, err
+			}
+			return true, o.cleanupVolumes(ctx, found)
+		})
+		if cleanupErr != nil {
+			return nil, errors.Join(createErr, fmt.Errorf("recovering boot volume %s (create ID %s): %w", name, requestID, cleanupErr))
+		}
+		return nil, createErr
+	}
+
+	if err := o.waitForVolumeStatus(ctx, vol.ID, "available", 300); err != nil {
+		waitErr := fmt.Errorf("boot volume %s did not become available: %w", vol.ID, err)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+		defer cancel()
+		if cleanupErr := o.CleanupVolume(cleanupCtx, vol.ID); cleanupErr != nil {
+			return vol, errors.Join(waitErr, fmt.Errorf("failed to clean up boot volume: %w", cleanupErr))
+		}
+		return nil, waitErr
+	}
+
+	return vol, nil
+}
+
+// CleanupVolume waits until Cinder accepts deletion or the volume is gone.
+// The caller must bound ctx; attachment transitions may outlive a Nova server.
+func (o *OpenstackClient) CleanupVolume(ctx context.Context, volumeID string) error {
+	err := waitFor(ctx, func(ctx context.Context) (bool, error) {
+		vol, err := volumes.Get(ctx, o.volume, volumeID).Extract()
+		if err != nil {
+			if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+				return true, nil
+			}
+			return false, fmt.Errorf("failed to get volume %s for cleanup: %w", volumeID, err)
+		}
+		if volumeCleanupPending(vol.Status) {
+			return false, nil
+		}
+		err = o.DeleteVolume(ctx, volumeID)
+		if gophercloud.ResponseCodeIs(err, http.StatusBadRequest) || gophercloud.ResponseCodeIs(err, http.StatusConflict) {
+			// A concurrent attachment may change the state after our GET.
+			current, getErr := volumes.Get(ctx, o.volume, volumeID).Extract()
+			if gophercloud.ResponseCodeIs(getErr, http.StatusNotFound) {
+				return true, nil
+			}
+			if getErr == nil && volumeCleanupPending(current.Status) {
+				return false, nil
+			}
+			return false, errors.Join(err, getErr)
+		}
+		return err == nil, err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to clean up volume %s: %w", volumeID, err)
+	}
+	return nil
+}
+
+func volumeCleanupPending(status string) bool {
+	switch status {
+	case volumeCreating, "downloading", "attaching", "in-use", "detaching", "reserved", "deleting":
+		return true
+	default:
+		return false
+	}
+}
+
+// DeleteVolume deletes a Cinder volume by ID.
+func (o *OpenstackClient) DeleteVolume(ctx context.Context, volumeID string) error {
+	err := volumes.Delete(ctx, o.volume, volumeID, nil).ExtractErr()
+	if err != nil {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete volume %s: %w", volumeID, err)
+	}
+	return nil
+}
+
+func (o *OpenstackClient) waitForVolumeStatus(ctx context.Context, id, status string, secs int) error {
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(secs)*time.Second)
+	defer cancel()
+
+	return waitFor(waitCtx, func(ctx context.Context) (bool, error) {
+		vol, err := volumes.Get(ctx, o.volume, id).Extract()
+		if err != nil {
+			return false, fmt.Errorf("could not find volume %s: %w", id, err)
+		}
+
+		if vol.Status == status {
+			return true, nil
+		}
+
+		if vol.Status == "error" {
+			return false, fmt.Errorf("volume %s entered error state", id)
+		}
+
+		return false, nil
+	})
+}
+
+// CleanupBootVolumes removes volumes left by failed creates of the named runner.
+func (o *OpenstackClient) CleanupBootVolumes(ctx context.Context, instanceName string) error {
+	found, err := o.listBootVolumes(ctx, instanceName+"-root", "")
+	if err != nil {
+		return err
+	}
+	return o.cleanupVolumes(ctx, found)
+}
+
+func (o *OpenstackClient) listBootVolumes(ctx context.Context, name, requestID string) ([]volumes.Volume, error) {
+	if o.controllerID == "" {
+		return nil, fmt.Errorf("controller ID is required to identify boot volumes")
+	}
+	pages, err := volumes.List(o.volume, volumes.ListOpts{Name: name}).AllPages(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing boot volumes: %w", err)
+	}
+	listed, err := volumes.ExtractVolumes(pages)
+	if err != nil {
+		return nil, fmt.Errorf("extracting boot volumes: %w", err)
+	}
+	var found []volumes.Volume
+	for _, vol := range listed {
+		if vol.Name != name || vol.Metadata[controllerIDTagName] != o.controllerID || vol.Metadata[bootVolumeRequestIDKey] == "" {
+			continue
+		}
+		if requestID == "" || vol.Metadata[bootVolumeRequestIDKey] == requestID {
+			found = append(found, vol)
+		}
+	}
+	return found, nil
+}
+
+func (o *OpenstackClient) cleanupVolumes(ctx context.Context, found []volumes.Volume) error {
+	var errs []error
+	for _, vol := range found {
+		if err := o.CleanupVolume(ctx, vol.ID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
