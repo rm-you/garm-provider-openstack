@@ -54,6 +54,7 @@ type extraSpecs struct {
 	EnableBootDebug    *bool    `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable cloud-init debug mode. Adds 'set -x' into the cloud-init script."`
 	DisableUpdates     *bool    `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
 	ExtraPackages      []string `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
+	AvailabilityZone   string   `json:"availability_zone,omitempty" jsonschema:"description=The availability zone in which to create the server."`
 	// The Cloudconfig struct from common package
 	cloudconfig.CloudConfigSpec
 }
@@ -153,6 +154,7 @@ func NewMachineSpec(data params.BootstrapInstance, cfg *config.Config, controlle
 		BootFromVolume:     cfg.BootFromVolume,
 		BootDiskSize:       bootDiskSize,
 		UseConfigDrive:     cfg.UseConfigDrive,
+		AvailabilityZone:   cfg.AvailabilityZone,
 		Flavor:             data.Flavor,
 		Image:              data.Image,
 		Tools:              tools,
@@ -179,6 +181,7 @@ type machineSpec struct {
 	BootFromVolume     bool
 	BootDiskSize       int64
 	UseConfigDrive     bool
+	AvailabilityZone   string
 	Flavor             string
 	Image              string
 	DisableUpdates     bool
@@ -282,6 +285,10 @@ func (m *machineSpec) MergeExtraSpecs(spec extraSpecs) {
 	if config.IsValidVisibility(spec.ImageVisibility) {
 		m.ImageVisibility = spec.ImageVisibility
 	}
+
+	if spec.AvailabilityZone != "" {
+		m.AvailabilityZone = spec.AvailabilityZone
+	}
 }
 
 func (m *machineSpec) ComposeUserData() ([]byte, error) {
@@ -306,10 +313,11 @@ func (m *machineSpec) GetServerCreateOpts(flavor flavors.Flavor, net networks.Ne
 		return servers.CreateOpts{}, fmt.Errorf("failed to get user data: %w", err)
 	}
 	return servers.CreateOpts{
-		Name:           m.BootstrapParams.Name,
-		ImageRef:       img.ID,
-		FlavorRef:      flavor.ID,
-		SecurityGroups: m.SecurityGroups,
+		Name:             m.BootstrapParams.Name,
+		ImageRef:         img.ID,
+		FlavorRef:        flavor.ID,
+		SecurityGroups:   m.SecurityGroups,
+		AvailabilityZone: m.AvailabilityZone,
 		Networks: []servers.Network{
 			{
 				UUID: net.ID,
@@ -322,19 +330,17 @@ func (m *machineSpec) GetServerCreateOpts(flavor flavors.Flavor, net networks.Ne
 	}, nil
 }
 
-func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts) (servers.CreateOpts, error) {
+func (m *machineSpec) GetBootFromVolumeOpts(srvOpts servers.CreateOpts, volumeID string) servers.CreateOpts {
 	rootDisk := servers.BlockDevice{
 		DeleteOnTermination: true,
 		DestinationType:     servers.DestinationVolume,
-		SourceType:          servers.SourceImage,
-		UUID:                srvOpts.ImageRef,
-		VolumeSize:          int(m.BootDiskSize),
-	}
-	if m.StorageBackend != "" {
-		rootDisk.VolumeType = m.StorageBackend
+		SourceType:          servers.SourceVolume,
+		UUID:                volumeID,
+		BootIndex:           0,
 	}
 	srvOpts.BlockDevice = []servers.BlockDevice{rootDisk}
-	return srvOpts, nil
+	srvOpts.ImageRef = ""
+	return srvOpts
 }
 
 func Ptr[T any](v T) *T {
