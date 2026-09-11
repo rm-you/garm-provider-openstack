@@ -118,6 +118,10 @@ type Config struct {
 
 	// AuthTokenCacheNamespace identifies the WebSSO profile. It defaults to Cloud.
 	AuthTokenCacheNamespace string `toml:"auth_token_cache_namespace"`
+
+	// AvailabilityZone selects the default server availability zone.
+	// This value can be overwritten using extra_specs.
+	AvailabilityZone string `toml:"availability_zone"`
 }
 
 func (c *Config) Validate() error {
