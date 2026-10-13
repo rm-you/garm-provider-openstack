@@ -23,14 +23,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/auth"
+	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	gophercloudconfig "github.com/gophercloud/gophercloud/v2/openstack/config"
+	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/gophercloud/gophercloud/v2/pagination"
-	"github.com/gophercloud/utils/v2/openstack/clientconfig"
 
 	"github.com/cloudbase/garm-provider-openstack/config"
+	"github.com/cloudbase/garm-provider-openstack/internal/keyringcache"
 )
 
 const (
@@ -46,28 +50,62 @@ func NewClient(ctx context.Context, cfg *config.Config, controllerID string) (*O
 		return nil, fmt.Errorf("failed to validate credentials: %w", err)
 	}
 
-	opts := clientconfig.ClientOpts{
-		Cloud:    cfg.Cloud,
-		YAMLOpts: &cfg.Credentials,
+	parseOpts, err := cloudParseOptions(cfg)
+	if err != nil {
+		return nil, err
 	}
-	compute, err := clientconfig.NewServiceClient(ctx, "compute", &opts)
+	cloud, endpointOpts, tlsConfig, err := clouds.Parse(parseOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cloud configuration: %w", err)
+	}
+	var authOpts []auth.CloudOption
+	if cfg.EnableAuthTokenCache {
+		authOpts = append(authOpts, auth.WithTokenCache(keyringcache.New()))
+		if cfg.AuthTokenCacheNamespace != "" {
+			authOpts = append(authOpts, auth.WithTokenCacheNamespace(cfg.AuthTokenCacheNamespace))
+		}
+	}
+	authOptions, err := compatibleCloud(cloud).ToAuthOptions(authOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load authentication options: %w", err)
+	}
+	provider, err := gophercloudconfig.NewProviderClient(ctx, authOptions, gophercloudconfig.WithTLSConfig(tlsConfig))
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %w", err)
+	}
+
+	compute, err := openstack.NewComputeV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get compute client: %w", err)
 	}
 	// Enables filter by tags, metadata property in VM list and boot from volume.
 	compute.Microversion = "2.67"
 
-	glance, err := clientconfig.NewServiceClient(ctx, "image", &opts)
+	glance, err := openstack.NewImageV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get glance client: %w", err)
 	}
 
-	neutron, err := clientconfig.NewServiceClient(ctx, "network", &opts)
+	neutron, err := openstack.NewNetworkV2(ctx, provider, endpointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get neutron client: %w", err)
 	}
 
-	cinder, err := clientconfig.NewServiceClient(ctx, "volume", &opts)
+	volumeVersion := cloud.VolumeAPIVersion
+	if volumeVersion == "" {
+		volumeVersion = "3"
+	}
+	var cinder *gophercloud.ServiceClient
+	switch volumeVersion {
+	case "v1", "1":
+		cinder, err = openstack.NewBlockStorageV1(ctx, provider, endpointOpts)
+	case "v2", "2":
+		cinder, err = openstack.NewBlockStorageV2(ctx, provider, endpointOpts)
+	case "v3", "3":
+		cinder, err = openstack.NewBlockStorageV3(ctx, provider, endpointOpts)
+	default:
+		return nil, fmt.Errorf("invalid volume API version %q", volumeVersion)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cinder client: %w", err)
 	}

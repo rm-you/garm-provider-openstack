@@ -1,0 +1,363 @@
+// package clouds provides a parser for OpenStack credentials stored in a clouds.yaml file.
+//
+// Example use:
+//
+//	ctx := context.Background()
+//	cloud, eo, tlsConfig, err := clouds.Parse()
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	opts, err := cloud.ToAuthOptions()
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	providerClient, err := config.NewProviderClient(ctx, opts, config.WithTLSConfig(tlsConfig))
+//	if err != nil {
+//		panic(err)
+//	}
+//
+//	networkClient, err := openstack.NewNetworkV2(ctx, providerClient, eo)
+//	if err != nil {
+//		panic(err)
+//	}
+package clouds
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"reflect"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"go.yaml.in/yaml/v3"
+)
+
+// Parse fetches a clouds.yaml file from disk and returns the parsed
+// credentials.
+//
+// By default this function mimics the behaviour of python-openstackclient, which is:
+//
+//   - if the environment variable `OS_CLIENT_CONFIG_FILE` is set and points to a
+//     clouds.yaml, use that location as the only search location for `clouds.yaml` and `secure.yaml`;
+//   - otherwise, the search locations for `clouds.yaml` and `secure.yaml` are:
+//     1. the current working directory (on Linux: `./`)
+//     2. the directory `openstack` under the standard user config location for
+//     the operating system (on Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/openstack/`)
+//     3. on Linux, `/etc/openstack/`
+//
+// Once `clouds.yaml` is found in a search location, the same location is used to search for `secure.yaml`.
+//
+// Like in python-openstackclient, relative paths in the `clouds.yaml` section
+// `cacert` are interpreted as relative the the current directory, and not to
+// the `clouds.yaml` location.
+//
+// Search locations, as well as individual `clouds.yaml` properties, can be
+// overwritten with functional options.
+func Parse(opts ...ParseOption) (Cloud, gophercloud.EndpointOpts, *tls.Config, error) {
+	options := cloudOpts{
+		cloudName:    os.Getenv("OS_CLOUD"),
+		region:       os.Getenv("OS_REGION_NAME"),
+		endpointType: os.Getenv("OS_INTERFACE"),
+		locations: func() map[cloudsType][]string {
+			out := make(map[cloudsType][]string)
+			if path := os.Getenv("OS_CLIENT_CONFIG_FILE"); path != "" {
+				out[cloudsDefault] = []string{path}
+			}
+			return out
+		}(),
+		locationsOverridden: make(map[cloudsType]bool),
+		readers:             make(map[cloudsType]io.Reader),
+		readersOverridden:   make(map[cloudsType]bool),
+	}
+
+	for _, apply := range opts {
+		apply(&options)
+	}
+
+	if options.cloudName == "" {
+		return Cloud{}, gophercloud.EndpointOpts{}, nil, fmt.Errorf("the empty string \"\" is not a valid cloud name")
+	}
+
+	clouds, err := readClouds(&options, cloudsDefault)
+	if err != nil {
+		return Cloud{}, gophercloud.EndpointOpts{}, nil, err
+	}
+
+	cloud, ok := clouds[options.cloudName]
+	if !ok {
+		return Cloud{}, gophercloud.EndpointOpts{}, nil, fmt.Errorf("cloud %q not found in clouds.yaml", options.cloudName)
+	}
+
+	secureClouds, err := readClouds(&options, secure)
+	if err != nil {
+		// For secure.yaml we ignore if there is not secure.yaml file found
+		if _, ok := err.(ErrFileNotFound); !ok {
+			return Cloud{}, gophercloud.EndpointOpts{}, nil, err
+		}
+
+	}
+	secure, ok := secureClouds[options.cloudName]
+	if ok {
+		if !reflect.DeepEqual(cloud, secure) {
+			cloud, err = mergeClouds(secure, cloud)
+			if err != nil {
+				return Cloud{}, gophercloud.EndpointOpts{}, nil, fmt.Errorf("unable to merge information from clouds.yaml and secure.yaml: %w", err)
+			}
+		}
+	}
+
+	var profile string
+	if cloud.Profile != "" {
+		profile = cloud.Profile
+	} else if cloud.Cloud != "" {
+		profile = cloud.Cloud
+	}
+
+	if profile != "" {
+		publicsCloud, err := readClouds(&options, public)
+		if err != nil {
+			return Cloud{}, gophercloud.EndpointOpts{}, nil, err
+		}
+
+		public, ok := publicsCloud[profile]
+		if ok {
+			cloud, err = mergeClouds(cloud, public)
+			if err != nil {
+				return Cloud{}, gophercloud.EndpointOpts{}, nil, err
+			}
+		}
+	}
+
+	// Normalize domain when project scoped
+	if cloud.Auth != nil {
+		_, hasProjectID := cloud.Auth["project_id"]
+		_, hasProjectName := cloud.Auth["project_name"]
+		if hasProjectID || hasProjectName {
+			normalizeDomain(&cloud)
+		}
+	}
+
+	tlsConfig, err := computeTLSConfig(cloud, options)
+	if err != nil {
+		return Cloud{}, gophercloud.EndpointOpts{}, nil, fmt.Errorf("unable to compute TLS configuration: %w", err)
+	}
+
+	endpointType := coalesce(options.endpointType, cloud.EndpointType, cloud.Interface)
+	cloud.Name = options.cloudName
+
+	return cloud,
+		gophercloud.EndpointOpts{
+			Region:       coalesce(options.region, cloud.RegionName),
+			Availability: computeAvailability(endpointType),
+		},
+		tlsConfig,
+		nil
+}
+
+func readClouds(options *cloudOpts, ctype cloudsType) (map[string]Cloud, error) {
+	// Set the defaults and open the files for reading. This code only runs
+	// if no override has been set, because it is fallible.
+	if options.readers[ctype] == nil {
+		// WithCloudsYaml was given to override clouds.yaml content
+		// don't look up secure.yaml from filesystem
+		if ctype == secure && options.readersOverridden[cloudsDefault] {
+			return map[string]Cloud{}, nil
+		}
+
+		if len(options.locations[ctype]) < 1 {
+			// WithLocation was given and with no WithSecureLocation, try to read
+			// secure.yaml aside clouds.yaml found
+			if ctype == secure && options.locationsOverridden[cloudsDefault] && !options.locationsOverridden[secure] {
+				options.locations[ctype] = []string{options.secureAsideLocation}
+			} else {
+
+				cwd, err := os.Getwd()
+				if err != nil {
+					return map[string]Cloud{}, fmt.Errorf("failed to get the current working directory: %w", err)
+				}
+				userConfig, err := getUserConfig()
+				if err != nil {
+					return map[string]Cloud{}, err
+				}
+				options.locations[ctype] = []string{path.Join(cwd, string(ctype)), path.Join(userConfig, "openstack", string(ctype)), path.Join("/etc", "openstack", string(ctype))}
+
+			}
+		}
+
+		for _, cloudsPath := range options.locations[ctype] {
+			f, err := os.Open(cloudsPath)
+			if err != nil {
+				continue
+			}
+			defer f.Close()
+			options.readers[ctype] = f
+			if ctype == cloudsDefault {
+				aside := path.Join(path.Dir(cloudsPath), "secure.yaml")
+				options.secureAsideLocation = aside
+			}
+			break
+		}
+		if options.readers[ctype] == nil {
+			return map[string]Cloud{}, ErrFileNotFound{
+				file:            string(ctype),
+				searchLocations: options.locations[ctype]}
+		}
+	}
+
+	// Parse the YAML payloads.
+	var cloudsMap map[string]Cloud
+	if ctype == public {
+		var clouds PublicClouds
+		if err := yaml.NewDecoder(options.readers[ctype]).Decode(&clouds); err != nil {
+			return map[string]Cloud{}, err
+		}
+		cloudsMap = clouds.Clouds
+	} else {
+		var clouds Clouds
+		if err := yaml.NewDecoder(options.readers[ctype]).Decode(&clouds); err != nil {
+			return map[string]Cloud{}, err
+		}
+		cloudsMap = clouds.Clouds
+	}
+
+	return cloudsMap, nil
+}
+
+func getUserConfig() (string, error) {
+	// Use XDG_CONFIG_HOME or fall back to ~/.config, matching the
+	// OpenStack convention for clouds.yaml location on all platforms.
+	userConfig := os.Getenv("XDG_CONFIG_HOME")
+	if userConfig != "" {
+		return userConfig, nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the user home directory: %w", err)
+	}
+	userConfig = path.Join(homeDir, ".config")
+	return userConfig, nil
+}
+
+// computeAvailability is a helper method to determine the endpoint type
+// requested by the user.
+func computeAvailability(endpointType string) gophercloud.Availability {
+	if endpointType == "internal" || endpointType == "internalURL" {
+		return gophercloud.AvailabilityInternal
+	}
+	if endpointType == "admin" || endpointType == "adminURL" {
+		return gophercloud.AvailabilityAdmin
+	}
+	return gophercloud.AvailabilityPublic
+}
+
+// coalesce returns the first argument that is not the zero value for its type,
+// or the zero value for its type.
+func coalesce[T comparable](items ...T) T {
+	var t T
+	for _, item := range items {
+		if item != t {
+			return item
+		}
+	}
+	return t
+}
+
+// mergeClouds merges two Clouds recursively (the Auth map also gets merged).
+// In case both Clouds define a value, the value in the 'override' cloud takes precedence
+func mergeClouds(override, cloud Cloud) (Cloud, error) {
+	overrideJson, err := json.Marshal(override)
+	if err != nil {
+		return Cloud{}, err
+	}
+	cloudJson, err := json.Marshal(cloud)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var overrideInterface any
+	err = json.Unmarshal(overrideJson, &overrideInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var cloudInterface any
+	err = json.Unmarshal(cloudJson, &cloudInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	var mergedCloud Cloud
+	mergedInterface := mergeInterfaces(overrideInterface, cloudInterface)
+	mergedJson, err := json.Marshal(mergedInterface)
+	if err != nil {
+		return Cloud{}, err
+	}
+	err = json.Unmarshal(mergedJson, &mergedCloud)
+	if err != nil {
+		return Cloud{}, err
+	}
+	return mergedCloud, nil
+}
+
+func normalizeDomain(cloud *Cloud) {
+	mappings := map[string][]string{
+		"domain_id":   {"user_domain_id", "project_domain_id"},
+		"domain_name": {"user_domain_name", "project_domain_name"},
+	}
+
+	for source, targets := range mappings {
+		value, ok := cloud.Auth[source]
+		if !ok {
+			continue
+		}
+
+		for _, target := range targets {
+			if _, exists := cloud.Auth[target]; !exists {
+				cloud.Auth[target] = value
+			}
+		}
+
+		delete(cloud.Auth, source)
+	}
+}
+
+// merges two interfaces. In cases where a value is defined for both 'overridingInterface' and
+// 'inferiorInterface' the value in 'overridingInterface' will take precedence.
+func mergeInterfaces(overridingInterface, inferiorInterface any) any {
+	switch overriding := overridingInterface.(type) {
+	case map[string]any:
+		interfaceMap, ok := inferiorInterface.(map[string]any)
+		if !ok {
+			return overriding
+		}
+		for k, v := range interfaceMap {
+			if overridingValue, ok := overriding[k]; ok {
+				overriding[k] = mergeInterfaces(overridingValue, v)
+			} else {
+				overriding[k] = v
+			}
+		}
+	case []any:
+		list, ok := inferiorInterface.([]any)
+		if !ok {
+			return overriding
+		}
+
+		return append(overriding, list...)
+	case nil:
+		// mergeClouds(nil, map[string]interface{...}) -> map[string]interface{...}
+		v, ok := inferiorInterface.(map[string]any)
+		if ok {
+			return v
+		}
+	}
+	// We don't want to override with empty values
+	if reflect.DeepEqual(overridingInterface, nil) || reflect.DeepEqual(reflect.Zero(reflect.TypeOf(overridingInterface)).Interface(), overridingInterface) {
+		return inferiorInterface
+	} else {
+		return overridingInterface
+	}
+}
